@@ -25,7 +25,7 @@ if __name__ == "__main__":
 
     fs = s3fs.S3FileSystem(anon=True)
 
-    aorc_sample_ds = xr.open_zarr(fs.get_mapper(f"{s3_base_path}1979.zarr"), consolidated=True)
+    aorc_sample_ds = xr.open_zarr(fs.get_mapper(f"{s3_base_path}1979_{year}.zarr"), consolidated=True)
 
     if isfile(PATH_TO_TEXAS_MASK):
         print(f"{datetime.now().timestamp()} [init] Existing mask dataset for Texas found.")
@@ -37,14 +37,6 @@ if __name__ == "__main__":
         set_num_threads(NUM_THREADS_NUMBA)
         texas_mask = get_data_array_mask(aorc_ds.latitude.values, aorc_ds.longitude.values, PATH_TO_TEXAS_SHP)
         texas_mask.to_netcdf("Texas_mask.nc")
-
-    print(f"{datetime.now().timestamp()} [init] Reading Zarr metadata for AORC datasets, concatenating over time.")
-    datasets = []
-    for year in range(1979, 2025):
-        datasets.append(xr.open_zarr(fs.get_mapper(f"{s3_base_path}{year}.zarr"), consolidated=True))
-
-    print(f"{datetime.now().timestamp()} [init] Applying Texas mask.")
-    aorc_ds = xr.concat(datasets, dim="time").where(texas_mask, drop=True)
 
     global_attrs = {
         "description": "Heat metrics derived from NOAA NWS AORC data provided via AWS S3 Zarr Bucket",
@@ -58,111 +50,114 @@ if __name__ == "__main__":
         "desc": "Statistic taken across 24 hours"
     }
 
+    for year in range(1979, 2025):
+        print(f"{datetime.now().timestamp()} [compute] Loading data and applying Texas mask for year {year}.")
+        aorc_ds = xr.open_zarr(fs.get_mapper(f"{s3_base_path}{year}_{year}.zarr"), consolidated=True).where(texas_mask, drop=True)
 
-    print(f"{datetime.now().timestamp()} [compute] Calculating heat index metrics.")
-    aorc_hi = xr.apply_ufunc(
-        metrics.get_aorc_heat_index,
-        aorc_ds["TMP_2maboveground"],
-        aorc_ds["SPFH_2maboveground"],
-        dask="parallelized",
-        output_dtypes=[float]
-    )
-    da = aorc_hi.resample(time="1D").mean()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"heat_index_mean": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_heat_index_mean.zarr", zarr_format=2
-    )
-    da = aorc_hi.resample(time="1D").min()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"heat_index_min": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_heat_index_min.zarr", zarr_format=2
-    )
-    da = aorc_hi.resample(time="1D").max()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"heat_index_max": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_heat_index_max.zarr", zarr_format=2
-    )
-    del aorc_hi
-
-
-    print(f"{datetime.now().timestamp()} [compute] Calculating apparent temperature metrics.")
-    aorc_atemp = xr.apply_ufunc(
-        metrics.get_aorc_apparent_temp,
-        aorc_ds["TMP_2maboveground"],
-        aorc_ds["UGRD_10maboveground"],
-        aorc_ds["UGRD_10maboveground"],
-        aorc_ds["VGRD_10maboveground"],
-        dask="parallelized",
-        output_dtypes=[float]
-    )
-    da = aorc_atemp.resample(time="1D").mean()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"apparent_temp_mean": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_apparent_temp_mean.zarr", zarr_format=2
-    )
-    da = aorc_atemp.resample(time="1D").min()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"apparent_temp_min": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_apparent_temp_min.zarr", zarr_format=2
-    )
-    da = aorc_atemp.resample(time="1D").max()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"apparent_temp_max": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_apparent_temp_max.zarr", zarr_format=2
-    )
-    del aorc_atemp
+        print(f"{datetime.now().timestamp()} [compute] Calculating heat index metrics for {year}.")
+        aorc_hi = xr.apply_ufunc(
+            metrics.get_aorc_heat_index,
+            aorc_ds["TMP_2maboveground"],
+            aorc_ds["SPFH_2maboveground"],
+            dask="parallelized",
+            output_dtypes=[float]
+        )
+        da = aorc_hi.resample(time="1D").mean().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"heat_index_mean": da}, attrs=global_attrs).to_zarr(
+            f"AORC_heat_index_mean_{year}.zarr", zarr_format=2
+        )
+        da = aorc_hi.resample(time="1D").min().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"heat_index_min": da}, attrs=global_attrs).to_zarr(
+            f"AORC_heat_index_min_{year}.zarr", zarr_format=2
+        )
+        da = aorc_hi.resample(time="1D").max().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"heat_index_max": da}, attrs=global_attrs).to_zarr(
+            f"AORC_heat_index_max_{year}.zarr", zarr_format=2
+        )
+        del aorc_hi
 
 
-    print(f"{datetime.now().timestamp()} [compute] Calculating humidex metrics.")
-    aorc_hdex = xr.apply_ufunc(
-        metrics.get_aorc_humidex,
-        aorc_ds["TMP_2maboveground"],
-        aorc_ds["SPFH_2maboveground"],
-        dask="parallelized",
-        output_dtypes=[float]
-    )
-    da = aorc_hdex.resample(time="1D").mean()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"humidex_mean": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_humidex_mean.zarr", zarr_format=2
-    )
-    da = aorc_hdex.resample(time="1D").min()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"humidex_min": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_humidex_min.zarr", zarr_format=2
-    )
-    da = aorc_hdex.resample(time="1D").max()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"humidex_max": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_humidex_max.zarr", zarr_format=2
-    )
-    del aorc_hdex
+        print(f"{datetime.now().timestamp()} [compute] Calculating apparent temperature metrics for {year}.")
+        aorc_atemp = xr.apply_ufunc(
+            metrics.get_aorc_apparent_temp,
+            aorc_ds["TMP_2maboveground"],
+            aorc_ds["UGRD_10maboveground"],
+            aorc_ds["UGRD_10maboveground"],
+            aorc_ds["VGRD_10maboveground"],
+            dask="parallelized",
+            output_dtypes=[float]
+        ).chunk('auto')
+        da = aorc_atemp.resample(time="1D").mean().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"apparent_temp_mean": da}, attrs=global_attrs).to_zarr(
+            f"AORC_apparent_temp_mean_{year}.zarr", zarr_format=2
+        )
+        da = aorc_atemp.resample(time="1D").min().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"apparent_temp_min": da}, attrs=global_attrs).to_zarr(
+            f"AORC_apparent_temp_min_{year}.zarr", zarr_format=2
+        )
+        da = aorc_atemp.resample(time="1D").max().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"apparent_temp_max": da}, attrs=global_attrs).to_zarr(
+            f"AORC_apparent_temp_max_{year}.zarr", zarr_format=2
+        )
+        del aorc_atemp
 
 
-    print(f"{datetime.now().timestamp()} [compute] Calculating simple wet-bulb globe temperature metrics.")
-    aorc_swbgt = xr.apply_ufunc(
-        metrics.get_aorc_swbgt,
-        aorc_ds["TMP_2maboveground"],
-        aorc_ds["SPFH_2maboveground"],
-        dask="parallelized",
-        output_dtypes=[float]
-    )
-    da = aorc_swbgt.resample(time="1D").mean()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"swbgt_mean": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_swbgt_mean.zarr", zarr_format=2
-    )
-    da = aorc_swbgt.resample(time="1D").min()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"swbgt_min": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_swbgt_min.zarr", zarr_format=2
-    )
-    da = aorc_swbgt.resample(time="1D").max()
-    da.attrs = var_attrs
-    xr.Dataset(data_vars={"swbgt_max": da}, attrs=global_attrs).chunk('auto').to_zarr(
-        "AORC_swbgt_max.zarr", zarr_format=2
-    )
-    del aorc_swbgt
+        print(f"{datetime.now().timestamp()} [compute] Calculating humidex metrics for {year}.")
+        aorc_hdex = xr.apply_ufunc(
+            metrics.get_aorc_humidex,
+            aorc_ds["TMP_2maboveground"],
+            aorc_ds["SPFH_2maboveground"],
+            dask="parallelized",
+            output_dtypes=[float]
+        ).chunk('auto')
+        da = aorc_hdex.resample(time="1D").mean().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"humidex_mean": da}, attrs=global_attrs).to_zarr(
+            f"AORC_humidex_mean_{year}.zarr", zarr_format=2
+        )
+        da = aorc_hdex.resample(time="1D").min().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"humidex_min": da}, attrs=global_attrs).to_zarr(
+            f"AORC_humidex_min_{year}.zarr", zarr_format=2
+        )
+        da = aorc_hdex.resample(time="1D").max().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"humidex_max": da}, attrs=global_attrs).to_zarr(
+            f"AORC_humidex_max_{year}.zarr", zarr_format=2
+        )
+        del aorc_hdex
+
+
+        print(f"{datetime.now().timestamp()} [compute] Calculating simple wet-bulb globe temperature metrics for {year}.")
+        aorc_swbgt = xr.apply_ufunc(
+            metrics.get_aorc_swbgt,
+            aorc_ds["TMP_2maboveground"],
+            aorc_ds["SPFH_2maboveground"],
+            dask="parallelized",
+            output_dtypes=[float]
+        ).chunk('auto')
+        da = aorc_swbgt.resample(time="1D").mean().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"swbgt_mean": da}, attrs=global_attrs).to_zarr(
+            f"AORC_swbgt_mean_{year}.zarr", zarr_format=2
+        )
+        da = aorc_swbgt.resample(time="1D").min().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"swbgt_min": da}, attrs=global_attrs).to_zarr(
+            f"AORC_swbgt_min_{year}.zarr", zarr_format=2
+        )
+        da = aorc_swbgt.resample(time="1D").max().chunk('auto')
+        da.attrs = var_attrs
+        xr.Dataset(data_vars={"swbgt_max": da}, attrs=global_attrs).to_zarr(
+            f"AORC_swbgt_max_{year}.zarr", zarr_format=2
+        )
+        del aorc_swbgt
 
     print("[final] Computations finished, shutting down Dask cluster.")
 
