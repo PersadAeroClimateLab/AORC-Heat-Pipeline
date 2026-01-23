@@ -10,10 +10,15 @@ from datetime import datetime
 
 PATH_TO_TEXAS_MASK = "boundary_data/texas_mask.nc"
 PATH_TO_TEXAS_SHP = "boundary_data/texas_shapefile/State_Boundary.shp"
-NUM_THREADS_NUMBA = 12
+NUM_THREADS_NUMBA = 2
 
 if __name__ == "__main__":
-    print(f"{datetime.now().timestamp()} [init] Starting AORC heat analysis pipeline")
+    print(f"{datetime.now().timestamp()} [init] Starting AORC heat analysis pipeline, initiating Dask cluster.")
+
+    cluster = LocalCluster(n_workers=30, threads_per_worker=2, memory_limit="20GB")
+    client = cluster.get_client()
+    set_num_threads(NUM_THREADS_NUMBA)
+    print(client)
 
     s3_base_path = "s3://noaa-nws-aorc-v1-1-1km/"
     print(f"{datetime.now().timestamp()} [init] Connecting to AORC S3 bucket '{s3_base_path}'")
