@@ -6,7 +6,7 @@ import numpy as np
 import s3fs
 import metrics
 from datetime import datetime
-
+from dask.distributed import LocalCluster, Client
 
 PATH_TO_TEXAS_MASK = "boundary_data/texas_mask.nc"
 PATH_TO_TEXAS_SHP = "boundary_data/texas_shapefile/State_Boundary.shp"
@@ -15,7 +15,7 @@ NUM_THREADS_NUMBA = 2
 if __name__ == "__main__":
     print(f"{datetime.now().timestamp()} [init] Starting AORC heat analysis pipeline, initiating Dask cluster.")
 
-    cluster = LocalCluster(n_workers=30, threads_per_worker=2, memory_limit="20GB")
+    cluster = LocalCluster(n_workers=30, threads_per_worker=2, memory_limit="20GB", dashboard_address=":8002")
     client = cluster.get_client()
     set_num_threads(NUM_THREADS_NUMBA)
     print(client)
@@ -84,44 +84,6 @@ if __name__ == "__main__":
     )
 
     print(f"{datetime.now().timestamp()} [init] Aggregating metrics and deriving mean/min/max task graphs.")
-    aorc_heat_metrics = xr.Dataset(
-        data_vars={
-            "heat_index_mean": aorc_hi.resample(time="1D").mean(),
-            "heat_index_min": aorc_hi.resample(time="1D").min(),
-            "heat_index_max": aorc_hi.resample(time="1D").max(),
-            "apparent_temp_mean": aorc_atemp.resample(time="1D").mean(),
-            "apparent_temp_min": aorc_atemp.resample(time="1D").min(),
-            "apparent_temp_max": aorc_atemp.resample(time="1D").max(),
-            "humidex_mean": aorc_hdex.resample(time="1D").mean(),
-            "humidex_min": aorc_hdex.resample(time="1D").min(),
-            "humidex_max": aorc_hdex.resample(time="1D").max(),
-            "swbgt_mean": aorc_swbgt.resample(time="1D").mean(),
-            "swbgt_min": aorc_swbgt.resample(time="1D").min(),
-            "swbgt_max": aorc_swbgt.resample(time="1D").max()
-        },
-        attrs={
-            "description": "Heat metrics derived from NOAA NWS AORC data provided via AWS S3 Zarr Bucket",
-            "source_version": "AORC Version 1.1", 
-            "source_url": "https://registry.opendata.aws/noaa-nws-aorc",
-        }
-    )
-
-    aorc_heat_metrics["heat_index_mean"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Mean Heat Index",
-        "source_timestep": "hourly",
-        "desc": "National Weather Service regression for heat index. Mean over 24 hours."
-    }
-    aorc_heat_metrics["heat_index_max"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Maximum Heat Index",
-        "source_timestep": "hourly",
-        "desc": "National Weather Service regression for heat index. Maximum over 24 hours."
-    }
-    aorc_heat_metrics["heat_index_min"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Minimum Heat Index",
-        "source_timestep": "hourly",print(f"{datetime.now().timestamp()} [init] Aggregating metrics and deriving mean/min/max task graphs.")
     aorc_heat_metrics = xr.Dataset(
         data_vars={
             "heat_index_mean": aorc_hi.resample(time="1D").mean(),
