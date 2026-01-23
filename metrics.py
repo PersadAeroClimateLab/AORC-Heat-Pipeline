@@ -158,6 +158,6 @@ def get_aorc_humidex(air_temp: float, specific_humid: float) -> float:
     return celsius_to_fahrenheit(humidex(air_temp, vapor_pressure(specific_humid)))
 
 @nb.njit
-def get_aorc_swgbt(air_temp: float, specific_humid: float) -> float:
+def get_aorc_swbgt(air_temp: float, specific_humid: float) -> float:
     air_temp -= 273.15
     return celsius_to_fahrenheit(swbgt(air_temp, vapor_pressure(specific_humid)))
