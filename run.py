@@ -46,17 +46,46 @@ if __name__ == "__main__":
     print(f"{datetime.now().timestamp()} [init] Applying Texas mask.")
     aorc_ds = xr.concat(datasets, dim="time").where(texas_mask, drop=True)
 
-    print(aorc_ds["TMP_2maboveground"])
+    global_attrs = {
+        "description": "Heat metrics derived from NOAA NWS AORC data provided via AWS S3 Zarr Bucket",
+        "source_version": "AORC Version 1.1", 
+        "source_url": "https://registry.opendata.aws/noaa-nws-aorc",
+    }
 
-    print(f"{datetime.now().timestamp()} [init] Building metric task graphs.")
+    var_attrs = {
+        "units": "deg_F",
+        "source_timestep": "hourly",
+        "desc": "Statistic taken across 24 hours"
+    }
+
+
+    print(f"{datetime.now().timestamp()} [compute] Calculating heat index metrics.")
     aorc_hi = xr.apply_ufunc(
         metrics.get_aorc_heat_index,
         aorc_ds["TMP_2maboveground"],
         aorc_ds["SPFH_2maboveground"],
         dask="parallelized",
         output_dtypes=[float]
-    ).chunk()
+    )
+    da = aorc_hi.resample(time="1D").mean()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"heat_index_mean": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_heat_index_mean.zarr", zarr_format=2
+    )
+    da = aorc_hi.resample(time="1D").min()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"heat_index_min": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_heat_index_min.zarr", zarr_format=2
+    )
+    da = aorc_hi.resample(time="1D").max()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"heat_index_max": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_heat_index_max.zarr", zarr_format=2
+    )
+    del aorc_hi
 
+
+    print(f"{datetime.now().timestamp()} [compute] Calculating apparent temperature metrics.")
     aorc_atemp = xr.apply_ufunc(
         metrics.get_aorc_apparent_temp,
         aorc_ds["TMP_2maboveground"],
@@ -65,178 +94,76 @@ if __name__ == "__main__":
         aorc_ds["VGRD_10maboveground"],
         dask="parallelized",
         output_dtypes=[float]
-    ).chunk()
+    )
+    da = aorc_atemp.resample(time="1D").mean()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"apparent_temp_mean": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_apparent_temp_mean.zarr", zarr_format=2
+    )
+    da = aorc_atemp.resample(time="1D").min()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"apparent_temp_min": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_apparent_temp_min.zarr", zarr_format=2
+    )
+    da = aorc_atemp.resample(time="1D").max()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"apparent_temp_max": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_apparent_temp_max.zarr", zarr_format=2
+    )
+    del aorc_atemp
 
+
+    print(f"{datetime.now().timestamp()} [compute] Calculating humidex metrics.")
     aorc_hdex = xr.apply_ufunc(
         metrics.get_aorc_humidex,
         aorc_ds["TMP_2maboveground"],
         aorc_ds["SPFH_2maboveground"],
         dask="parallelized",
         output_dtypes=[float]
-    ).chunk()
+    )
+    da = aorc_hdex.resample(time="1D").mean()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"humidex_mean": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_humidex_mean.zarr", zarr_format=2
+    )
+    da = aorc_hdex.resample(time="1D").min()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"humidex_min": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_humidex_min.zarr", zarr_format=2
+    )
+    da = aorc_hdex.resample(time="1D").max()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"humidex_max": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_humidex_max.zarr", zarr_format=2
+    )
+    del aorc_hdex
 
+
+    print(f"{datetime.now().timestamp()} [compute] Calculating simple wet-bulb globe temperature metrics.")
     aorc_swbgt = xr.apply_ufunc(
-        metrics.get_aorc_swgbt,
+        metrics.get_aorc_swbgt,
         aorc_ds["TMP_2maboveground"],
         aorc_ds["SPFH_2maboveground"],
         dask="parallelized",
         output_dtypes=[float]
-    ).chunk()
-
-    print(f"{datetime.now().timestamp()} [init] Aggregating metrics and deriving mean/min/max task graphs.")
-    aorc_heat_metrics = xr.Dataset(
-        data_vars={
-            "heat_index_mean": aorc_hi.resample(time="1D").mean(),
-            "heat_index_min": aorc_hi.resample(time="1D").min(),
-            "heat_index_max": aorc_hi.resample(time="1D").max(),
-            "apparent_temp_mean": aorc_atemp.resample(time="1D").mean(),
-            "apparent_temp_min": aorc_atemp.resample(time="1D").min(),
-            "apparent_temp_max": aorc_atemp.resample(time="1D").max(),
-            "humidex_mean": aorc_hdex.resample(time="1D").mean(),
-            "humidex_min": aorc_hdex.resample(time="1D").min(),
-            "humidex_max": aorc_hdex.resample(time="1D").max(),
-            "swbgt_mean": aorc_swbgt.resample(time="1D").mean(),
-            "swbgt_min": aorc_swbgt.resample(time="1D").min(),
-            "swbgt_max": aorc_swbgt.resample(time="1D").max()
-        },
-        attrs={
-            "description": "Heat metrics derived from NOAA NWS AORC data provided via AWS S3 Zarr Bucket",
-            "source_version": "AORC Version 1.1", 
-            "source_url": "https://registry.opendata.aws/noaa-nws-aorc",
-        }
     )
+    da = aorc_swbgt.resample(time="1D").mean()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"swbgt_mean": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_swbgt_mean.zarr", zarr_format=2
+    )
+    da = aorc_swbgt.resample(time="1D").min()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"swbgt_min": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_swbgt_min.zarr", zarr_format=2
+    )
+    da = aorc_swbgt.resample(time="1D").max()
+    da.attrs = var_attrs
+    xr.Dataset(data_vars={"swbgt_max": da}, attrs=global_attrs).chunk('auto').to_zarr(
+        "AORC_swbgt_max.zarr", zarr_format=2
+    )
+    del aorc_swbgt
 
-    aorc_heat_metrics["heat_index_mean"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Mean Heat Index",
-        "source_timestep": "hourly",
-        "desc": "National Weather Service regression for heat index. Mean over 24 hours."
-    }
-    aorc_heat_metrics["heat_index_max"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Maximum Heat Index",
-        "source_timestep": "hourly",
-        "desc": "National Weather Service regression for heat index. Maximum over 24 hours."
-    }
-    aorc_heat_metrics["heat_index_min"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Minimum Heat Index",
-        "source_timestep": "hourly",
-        "desc": "National Weather Service regression for heat index. Minimum over 24 hours."
-    }
+    print("[final] Computations finished, shutting down Dask cluster.")
 
-    aorc_heat_metrics["apparent_temp_mean"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Mean Apparent Temperature",
-        "source_timestep": "hourly",
-        "desc": "(temp + 0.33*vp - 0.7*sfcwind - 4.00) Mean over 24 hours."
-    }
-    aorc_heat_metrics["apparent_temp_max"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Maximum Apparent Temperature",
-        "source_timestep": "hourly",
-        "desc": "(temp + 0.33*vp - 0.7*sfcwind - 4.00) Maximum over 24 hours."
-    }
-    aorc_heat_metrics["apparent_temp_min"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Minimum Apparent Temperature",
-        "source_timestep": "hourly",
-        "desc": "(temp + 0.33*vp - 0.7*sfcwind - 4.00) Minimum over 24 hours."
-    }
-
-    aorc_heat_metrics["humidex_mean"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Mean Humidex",
-        "source_timestep": "hourly",
-        "desc": "(temp + 5/9*(6.112 * 10**(7.5*temp/(237.7 + temp)) * vp / 100 - 10)) Mean over 24 hours."
-    }
-    aorc_heat_metrics["humidex_max"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Maximum Humidex",
-        "source_timestep": "hourly",
-        "desc": "(temp + 5/9*(6.112 * 10**(7.5*temp/(237.7 + temp)) * vp / 100 - 10)) Maximum over 24 hours."
-    }
-    aorc_heat_metrics["humidex_min"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Minimum Humidex",
-        "source_timestep": "hourly",
-        "desc": "(temp + 5/9*(6.112 * 10**(7.5*temp/(237.7 + temp)) * vp / 100 - 10)) Minimum over 24 hours."
-    }
-
-    aorc_heat_metrics["swbgt_mean"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Mean Simple Wet-Bulb Globe Temperature",
-        "source_timestep": "hourly",
-        "desc": "((0.567*(temp) + 0.393*(vp) + 3.94)) Mean over 24 hours."
-    }
-    aorc_heat_metrics["swbgt_max"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Maximum Simple Wet-Bulb Globe Temperature",
-        "source_timestep": "hourly",
-        "desc": "((0.567*(temp) + 0.393*(vp) + 3.94)) Maximum over 24 hours."
-    }
-    aorc_heat_metrics["swbgt_min"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Minimum Simple Wet-Bulb Globe Temperature",
-        "source_timestep": "hourly",
-        "desc": "((0.567*(temp) + 0.393*(vp) + 3.94)) Minimum over 24 hours."
-    }
-
-    aorc_heat_metrics["apparent_temp_mean"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Mean Apparent Temperature",
-        "source_timestep": "hourly",
-        "desc": "(temp + 0.33*vp - 0.7*sfcwind - 4.00) Mean over 24 hours."
-    }
-    aorc_heat_metrics["apparent_temp_max"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Maximum Apparent Temperature",
-        "source_timestep": "hourly",
-        "desc": "(temp + 0.33*vp - 0.7*sfcwind - 4.00) Maximum over 24 hours."
-    }
-    aorc_heat_metrics["apparent_temp_min"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Minimum Apparent Temperature",
-        "source_timestep": "hourly",
-        "desc": "(temp + 0.33*vp - 0.7*sfcwind - 4.00) Minimum over 24 hours."
-    }
-
-    aorc_heat_metrics["humidex_mean"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Mean Humidex",
-        "source_timestep": "hourly",
-        "desc": "(temp + 5/9*(6.112 * 10**(7.5*temp/(237.7 + temp)) * vp / 100 - 10)) Mean over 24 hours."
-    }
-    aorc_heat_metrics["humidex_max"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Maximum Humidex",
-        "source_timestep": "hourly",
-        "desc": "(temp + 5/9*(6.112 * 10**(7.5*temp/(237.7 + temp)) * vp / 100 - 10)) Maximum over 24 hours."
-    }
-    aorc_heat_metrics["humidex_min"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Minimum Humidex",
-        "source_timestep": "hourly",
-        "desc": "(temp + 5/9*(6.112 * 10**(7.5*temp/(237.7 + temp)) * vp / 100 - 10)) Minimum over 24 hours."
-    }
-
-    aorc_heat_metrics["swbgt_mean"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Mean Simple Wet-Bulb Globe Temperature",
-        "source_timestep": "hourly",
-        "desc": "((0.567*(temp) + 0.393*(vp) + 3.94)) Mean over 24 hours."
-    }
-    aorc_heat_metrics["swbgt_max"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Maximum Simple Wet-Bulb Globe Temperature",
-        "source_timestep": "hourly",
-        "desc": "((0.567*(temp) + 0.393*(vp) + 3.94)) Maximum over 24 hours."
-    }
-    aorc_heat_metrics["swbgt_min"].attrs = {
-        "units": "deg_F",
-        "long_name": "Daily Minimum Simple Wet-Bulb Globe Temperature",
-        "source_timestep": "hourly",
-        "desc": "((0.567*(temp) + 0.393*(vp) + 3.94)) Minimum over 24 hours."
-    }
-
-    aorc_heat_metrics.to_zarr("AORC_heat_metrics.zarr")
+    client.shutdown()
