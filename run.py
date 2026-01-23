@@ -220,10 +220,6 @@ if __name__ == "__main__":
         "desc": "((0.567*(temp) + 0.393*(vp) + 3.94)) Minimum over 24 hours."
     }
 
-    print(aorc_heat_metrics)
-        "desc": "National Weather Service regression for heat index. Minimum over 24 hours."
-    }
-
     aorc_heat_metrics["apparent_temp_mean"].attrs = {
         "units": "deg_F",
         "long_name": "Daily Mean Apparent Temperature",
