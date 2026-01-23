@@ -55,7 +55,7 @@ if __name__ == "__main__":
         aorc_ds["SPFH_2maboveground"],
         dask="parallelized",
         output_dtypes=[float]
-    )
+    ).chunk()
 
     aorc_atemp = xr.apply_ufunc(
         metrics.get_aorc_apparent_temp,
@@ -65,7 +65,7 @@ if __name__ == "__main__":
         aorc_ds["VGRD_10maboveground"],
         dask="parallelized",
         output_dtypes=[float]
-    )
+    ).chunk()
 
     aorc_hdex = xr.apply_ufunc(
         metrics.get_aorc_humidex,
@@ -73,7 +73,7 @@ if __name__ == "__main__":
         aorc_ds["SPFH_2maboveground"],
         dask="parallelized",
         output_dtypes=[float]
-    )
+    ).chunk()
 
     aorc_swbgt = xr.apply_ufunc(
         metrics.get_aorc_swgbt,
@@ -81,7 +81,7 @@ if __name__ == "__main__":
         aorc_ds["SPFH_2maboveground"],
         dask="parallelized",
         output_dtypes=[float]
-    )
+    ).chunk()
 
     print(f"{datetime.now().timestamp()} [init] Aggregating metrics and deriving mean/min/max task graphs.")
     aorc_heat_metrics = xr.Dataset(
