@@ -30,34 +30,33 @@ def pointinpolygon(x,y,poly):
 
 
 @nb.njit(parallel=True)
-def parallelpointinpolygon(points, polygon):
+def parallelpointinpolygon(lats, lons, polygon):
     """
     https://stackoverflow.com/questions/36399381/whats-the-fastest-way-of-checking-if-a-point-is-inside-a-polygon-in-python
     """
-    D = np.empty(points.shape, dtype=nb.boolean) 
-    for i in nb.prange(0, len(D)):
-        D[i] = pointinpolygon(points[i,0], points[i,1], polygon)
-    return D   
+    D = np.empty((lats.size, lons.size), dtype=nb.boolean)
+    for i in nb.prange(0, D.shape[0]):
+        for j in nb.prange(0, D.shape[1]):
+            D[i, j] = pointinpolygon(lons[j], lats[i], polygon)
+    return D
 # ======================= End of copied code =======================
 
 def get_data_array_mask(lats, lons, shpfile_path):
     shapefile = gpd.read_file(shpfile_path).to_crs(crs=4326)
     polygon = np.array(shapefile.geometry[0].exterior.coords.xy).T
 
-    X, Y = np.meshgrid(lons, lats, indexing="ij")
-    points = np.column_stack((X.ravel(), Y.ravel()))
-    booleans = parallelpointinpolygon(points, polygon)
+    booleans = parallelpointinpolygon(lats, lons, polygon)
 
     return xarray.Dataset(
         data_vars={
-            "mask":(["y","x"], mask),
+            "mask":(["x","y"], booleans),
         },
         coords=dict(
-            lat=(["y", "x"], lats),
-            lon=(["y", "x"], lons),
+            latitude=(["x"], lats),
+            longitude=(["y"], lons),
         ),
         attrs={
-            "description": "binary mask of points from Daymet datasets that are inside the boundaries of Texas",
+            "description": "binary mask of points from reference dataset that are inside the boundaries of Texas",
             "shapefile_url": "https://gis-txdot.opendata.arcgis.com/datasets/texas-state-boundary/explore",
             "credit": "The nb functions used to quickly mask this data were found on a stack overflow post by the user 'epifanio'",
             "credit_url": "https://stackoverflow.com/questions/36399381/whats-the-fastest-way-of-checking-if-a-point-is-inside-a-polygon-in-python"
