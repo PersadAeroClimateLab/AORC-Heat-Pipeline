@@ -138,8 +138,7 @@ def swbgt(temp: float, vp: float) -> float:
     """
     return (0.567*(temp) + 0.393*(vp) + 3.94)
 
-
-@nb.vectorize([nb.float32(nb.float32, nb.float32)])
+@nb.njit
 def get_aorc_heat_index(air_temp: float, specific_humid: float) -> float:
     air_temp -= 273.15
     saturation_vp = saturation_vapor_pressure(air_temp)
@@ -147,21 +146,18 @@ def get_aorc_heat_index(air_temp: float, specific_humid: float) -> float:
     air_temp = celsius_to_fahrenheit(air_temp)
     return heat_index(air_temp, rel_humid)
 
-
-@nb.vectorize([nb.float32(nb.float32, nb.float32)])
+@nb.njit
 def get_aorc_apparent_temp(air_temp: float, u_wind: float, v_wind: float, specific_humid: float) -> float:
     sfcwind = np.sqrt((u_wind**2 + v_wind**2))
     air_temp -= 273.15
-    return apparent_temperature(air_temp, vapor_pressure(specific_humid), sfcwind)
+    return celsius_to_fahrenheit(apparent_temperature(air_temp, vapor_pressure(specific_humid), sfcwind))
 
-
-@nb.vectorize([nb.float32(nb.float32, nb.float32)])
+@nb.njit
 def get_aorc_humidex(air_temp: float, specific_humid: float) -> float:
     air_temp -= 273.15
-    return humidex(air_temp, vapor_pressure(specific_humid))
+    return celsius_to_fahrenheit(humidex(air_temp, vapor_pressure(specific_humid)))
 
-
-@nb.vectorize([nb.float32(nb.float32, nb.float32)])
+@nb.njit
 def get_aorc_swgbt(air_temp: float, specific_humid: float) -> float:
     air_temp -= 273.15
-    return swbgt(air_temp, vapor_pressure(specific_humid))
+    return celsius_to_fahrenheit(swbgt(air_temp, vapor_pressure(specific_humid)))
