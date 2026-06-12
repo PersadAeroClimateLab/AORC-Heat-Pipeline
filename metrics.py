@@ -9,17 +9,17 @@ from dask.distributed import Client, LocalCluster
 from time import time
 
 
-@nb.vectorize#([nb.float32(nb.float32)])
+@nb.vectorize
 def celsius_to_fahrenheit(temp: float) -> float:
     return (temp * 1.8) + 32
 
 
-@nb.vectorize#([nb.float32(nb.float32)])
+@nb.vectorize
 def fahrenheit_to_celsius(temp: float) -> float:
     return (temp - 32) / 1.8
 
 
-@nb.vectorize#([nb.float32(nb.float32, nb.float32)])
+@nb.vectorize
 def heat_index(temp: float, rel_humid: float) -> float:
     """
     Calculates heat index from temperature and relative humidity.
@@ -55,7 +55,7 @@ def heat_index(temp: float, rel_humid: float) -> float:
     return hi
 
 
-@nb.vectorize#([nb.float32(nb.float32)])
+@nb.vectorize
 def saturation_vapor_pressure(temp: float) -> float:
     """
     Calculates saturation vapor pressure from temperature using the Tetens equation.
@@ -73,7 +73,7 @@ def saturation_vapor_pressure(temp: float) -> float:
         return 6.1078*np.exp(21.875*temp / (temp + 265.5))
 
 
-@nb.vectorize#([nb.float32(nb.float32)])
+@nb.vectorize
 def vapor_pressure(huss: float) -> float:
     """
     Calculates vapor pressure from specific humidity.
@@ -91,7 +91,7 @@ def vapor_pressure(huss: float) -> float:
 
 
 
-@nb.vectorize#([nb.float32(nb.float32, nb.float32, nb.float32)])
+@nb.vectorize
 def apparent_temperature(temp: float, vp: float, sfcwind: float) -> float:
     """
     Calculates apparent temperature.
@@ -108,7 +108,7 @@ def apparent_temperature(temp: float, vp: float, sfcwind: float) -> float:
     return temp + 0.33*vp - 0.7*sfcwind - 4.00
 
 
-@nb.vectorize#([nb.float32(nb.float32, nb.float32)])
+@nb.vectorize
 def humidex(temp: float, vp: float) -> float:
     """
     Calculates apparent temperature.
@@ -123,7 +123,7 @@ def humidex(temp: float, vp: float) -> float:
     return temp + 5/9*(vp - 10)
 
 
-@nb.vectorize#([nb.float32(nb.float32, nb.float32)])
+@nb.vectorize
 def swbgt(temp: float, vp: float) -> float:
     """
     Calculates simple wet-bulb globe temperature.
@@ -150,7 +150,7 @@ def ddt_saturation_vapor_pressure(temp: float, esat: float) -> float:
         return esat * (21.875 * 265.5) / (temp + 265.5) ** 2
 
 
-@nb.vectorize#([nb.float32(nb.float32, nb.float32, nb.float32, nb.float32, nb.float32)])
+@nb.vectorize
 def wbt(temp: float, specific_humid: float, pressure: float) -> float:
     """
     Calculates the thermodynamic (isobaric/psychrometric) wet-bulb temperature
@@ -235,3 +235,10 @@ def get_aorc_humidex(air_temp: float, specific_humid: float) -> float:
 def get_aorc_swbgt(air_temp: float, specific_humid: float) -> float:
     air_temp -= 273.15
     return celsius_to_fahrenheit(swbgt(air_temp, vapor_pressure(specific_humid)))
+
+
+@nb.njit
+def get_aorc_wbt(air_temp: float, specific_humid: float, surface_pressure: float) -> float:
+    air_temp -= 273.15
+    surface_pressure /= 100
+    return celsius_to_fahrenheit(wbt(air_temp, specific_humid, surface_pressure))
