@@ -1,12 +1,6 @@
-from os import listdir
-from os.path import isdir
-import numpy as np
 import xarray
-import dask.array as da
+import numpy as np
 import numba as nb
-import dask
-from dask.distributed import Client, LocalCluster
-from time import time
 
 
 @nb.vectorize
