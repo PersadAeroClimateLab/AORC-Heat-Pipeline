@@ -96,21 +96,21 @@ if __name__ == "__main__":
         ).chunk('auto')
         da = aorc_atemp.resample(time="1D").mean().chunk('auto')
         da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_apparent_temp_mean_{year}.zarr"):
+        if not isdir(f"yearly_metrics_zarrs/AORC_apparent-temp_mean_{year}.zarr"):
             xr.Dataset(data_vars={"apparent_temp_mean": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_apparent_temp_mean_{year}.zarr", zarr_format=2
+                f"yearly_metrics_zarrs/AORC_apparent-temp_mean_{year}.zarr", zarr_format=2
             )
         da = aorc_atemp.resample(time="1D").min().chunk('auto')
         da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_apparent_temp_min_{year}.zarr"):
+        if not isdir(f"yearly_metrics_zarrs/AORC_apparent-temp_min_{year}.zarr"):
             xr.Dataset(data_vars={"apparent_temp_min": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_apparent_temp_min_{year}.zarr", zarr_format=2
+                f"yearly_metrics_zarrs/AORC_apparent-temp_min_{year}.zarr", zarr_format=2
             )
         da = aorc_atemp.resample(time="1D").max().chunk('auto')
         da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_apparent_temp_max_{year}.zarr"):
+        if not isdir(f"yearly_metrics_zarrs/AORC_apparent-temp_max_{year}.zarr"):
             xr.Dataset(data_vars={"apparent_temp_max": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_apparent_temp_max_{year}.zarr", zarr_format=2
+                f"yearly_metrics_zarrs/AORC_apparent-temp_max_{year}.zarr", zarr_format=2
             )
         del aorc_atemp
 
