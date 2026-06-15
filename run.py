@@ -65,21 +65,21 @@ if __name__ == "__main__":
         )
         da = aorc_hi.resample(time="1D").mean().chunk('auto')
         da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_heat_index_mean_{year}.zarr"):
+        if not isdir(f"yearly_metrics_zarrs/AORC_heat-index_mean_{year}.zarr"):
             xr.Dataset(data_vars={"heat_index_mean": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_heat_index_mean_{year}.zarr", zarr_format=2
+                f"yearly_metrics_zarrs/AORC_heat-index_mean_{year}.zarr", zarr_format=2
             )
         da = aorc_hi.resample(time="1D").min().chunk('auto')
         da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_heat_index_min_{year}.zarr"):
+        if not isdir(f"yearly_metrics_zarrs/AORC_heat-index_min_{year}.zarr"):
             xr.Dataset(data_vars={"heat_index_min": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_heat_index_min_{year}.zarr", zarr_format=2
+                f"yearly_metrics_zarrs/AORC_heat-index_min_{year}.zarr", zarr_format=2
             )
         da = aorc_hi.resample(time="1D").max().chunk('auto')
         da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_heat_index_max_{year}.zarr"):
+        if not isdir(f"yearly_metrics_zarrs/AORC_heat-index_max_{year}.zarr"):
             xr.Dataset(data_vars={"heat_index_max": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_heat_index_max_{year}.zarr", zarr_format=2
+                f"yearly_metrics_zarrs/AORC_heat-index_max_{year}.zarr", zarr_format=2
             )
         del aorc_hi
 
