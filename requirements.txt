@@ -3,8 +3,8 @@ netcdf4
 numba
 dask[distributed]
 xarray
-cftime
 zarr
 cftime
 s3fs
 geopandas
+pytest
