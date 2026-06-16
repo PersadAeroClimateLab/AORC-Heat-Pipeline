@@ -35,8 +35,8 @@ if __name__ == "__main__":
     else:
         print(f"{datetime.now().timestamp()} [init] A mask dataset for Texas must generated since none was found. This may take a while!")
         set_num_threads(NUM_THREADS_NUMBA)
-        texas_mask = get_data_array_mask(aorc_ds.latitude.values, aorc_ds.longitude.values, PATH_TO_TEXAS_SHP)
-        texas_mask.to_netcdf("Texas_mask.nc")
+        texas_mask = get_data_array_mask(aorc_sample_ds.latitude.values, aorc_sample_ds.longitude.values, PATH_TO_TEXAS_SHP)
+        texas_mask.to_netcdf(PATH_TO_TEXAS_MASK)
 
     global_attrs = {
         "description": "Heat metrics derived from NOAA NWS AORC data provided via AWS S3 Zarr Bucket",
@@ -226,6 +226,34 @@ if __name__ == "__main__":
         if not isdir(f"yearly_metrics_zarrs/AORC_wbt_max_{year}.zarr"):
             xr.Dataset(data_vars={"wbt_max": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_wbt_max_{year}.zarr", zarr_format=2
+            )
+
+
+        print(f"{datetime.now().timestamp()} [compute] Calculating daily Romps heat-index metrics for {year}.")
+        aorc_rhi = xr.apply_ufunc(
+            metrics.get_aorc_romps_heat_index,
+            aorc_ds["TMP_2maboveground"],
+            aorc_ds["SPFH_2maboveground"],
+            dask="parallelized",
+            output_dtypes=[float]
+        ).chunk('auto')
+        da = aorc_rhi.resample(time="1D").mean().chunk('auto')
+        da.attrs = var_attrs
+        if not isdir(f"yearly_metrics_zarrs/AORC_rhi_mean_{year}.zarr"):
+            xr.Dataset(data_vars={"rhi_mean": da}, attrs=global_attrs).to_zarr(
+                f"yearly_metrics_zarrs/AORC_rhi_mean_{year}.zarr", zarr_format=2
+            )
+        da = aorc_rhi.resample(time="1D").min().chunk('auto')
+        da.attrs = var_attrs
+        if not isdir(f"yearly_metrics_zarrs/AORC_rhi_min_{year}.zarr"):
+            xr.Dataset(data_vars={"rhi_min": da}, attrs=global_attrs).to_zarr(
+                f"yearly_metrics_zarrs/AORC_rhi_min_{year}.zarr", zarr_format=2
+            )
+        da = aorc_rhi.resample(time="1D").max().chunk('auto')
+        da.attrs = var_attrs
+        if not isdir(f"yearly_metrics_zarrs/AORC_rhi_max_{year}.zarr"):
+            xr.Dataset(data_vars={"rhi_max": da}, attrs=global_attrs).to_zarr(
+                f"yearly_metrics_zarrs/AORC_rhi_max_{year}.zarr", zarr_format=2
             )
     
     print("[final] Computations finished, shutting down Dask cluster.")
