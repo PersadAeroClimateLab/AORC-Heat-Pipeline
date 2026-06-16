@@ -4,6 +4,7 @@ from os.path import isfile, isdir
 import xarray as xr
 import numpy as np
 import s3fs
+import dask
 import metrics
 from datetime import datetime
 from dask.distributed import LocalCluster, Client
@@ -209,24 +210,23 @@ if __name__ == "__main__":
             dask="parallelized",
             output_dtypes=[float]
         ).chunk('auto')
-        da = aorc_wbt.resample(time="1D").mean().chunk('auto')
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_wbt_mean_{year}.zarr"):
-            xr.Dataset(data_vars={"wbt_mean": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_wbt_mean_{year}.zarr", zarr_format=2
-            )
-        da = aorc_wbt.resample(time="1D").min().chunk('auto')
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_wbt_min_{year}.zarr"):
-            xr.Dataset(data_vars={"wbt_min": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_wbt_min_{year}.zarr", zarr_format=2
-            )
-        da = aorc_wbt.resample(time="1D").max().chunk('auto')
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_wbt_max_{year}.zarr"):
-            xr.Dataset(data_vars={"wbt_max": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_wbt_max_{year}.zarr", zarr_format=2
-            )
+        # Newton-iterated wet-bulb solve; batch the reductions into one dask.compute
+        # so the shared `aorc_wbt` nodes are evaluated once instead of per to_zarr.
+        daily_wbt = aorc_wbt.resample(time="1D")
+        wbt_writes = []
+        for reduction, name in (("mean", "wbt_mean"), ("min", "wbt_min"), ("max", "wbt_max")):
+            path = f"yearly_metrics_zarrs/AORC_{name}_{year}.zarr"
+            if not isdir(path):
+                da = getattr(daily_wbt, reduction)().chunk('auto')
+                da.attrs = var_attrs
+                wbt_writes.append(
+                    xr.Dataset(data_vars={name: da}, attrs=global_attrs).to_zarr(
+                        path, zarr_format=2, compute=False
+                    )
+                )
+        if wbt_writes:
+            dask.compute(*wbt_writes)
+        del aorc_wbt
 
 
         print(f"{datetime.now().timestamp()} [compute] Calculating daily Romps heat-index metrics for {year}.")
@@ -237,24 +237,25 @@ if __name__ == "__main__":
             dask="parallelized",
             output_dtypes=[float]
         ).chunk('auto')
-        da = aorc_rhi.resample(time="1D").mean().chunk('auto')
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_rhi_mean_{year}.zarr"):
-            xr.Dataset(data_vars={"rhi_mean": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_rhi_mean_{year}.zarr", zarr_format=2
-            )
-        da = aorc_rhi.resample(time="1D").min().chunk('auto')
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_rhi_min_{year}.zarr"):
-            xr.Dataset(data_vars={"rhi_min": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_rhi_min_{year}.zarr", zarr_format=2
-            )
-        da = aorc_rhi.resample(time="1D").max().chunk('auto')
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_rhi_max_{year}.zarr"):
-            xr.Dataset(data_vars={"rhi_max": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_rhi_max_{year}.zarr", zarr_format=2
-            )
+        # The Romps solve is the most expensive ufunc in the pipeline. Build the
+        # three daily reductions as deferred writes and execute them in a single
+        # dask.compute so the shared `aorc_rhi` nodes are evaluated only once
+        # (rather than recomputed per to_zarr), while keeping separate stores.
+        daily_rhi = aorc_rhi.resample(time="1D")
+        rhi_writes = []
+        for reduction, name in (("mean", "rhi_mean"), ("min", "rhi_min"), ("max", "rhi_max")):
+            path = f"yearly_metrics_zarrs/AORC_{name}_{year}.zarr"
+            if not isdir(path):
+                da = getattr(daily_rhi, reduction)().chunk('auto')
+                da.attrs = var_attrs
+                rhi_writes.append(
+                    xr.Dataset(data_vars={name: da}, attrs=global_attrs).to_zarr(
+                        path, zarr_format=2, compute=False
+                    )
+                )
+        if rhi_writes:
+            dask.compute(*rhi_writes)
+        del aorc_rhi
     
     print("[final] Computations finished, shutting down Dask cluster.")
 

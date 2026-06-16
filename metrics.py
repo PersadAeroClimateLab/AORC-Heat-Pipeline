@@ -333,7 +333,7 @@ def _hi_bisect_skin(kind: int, x1: float, x2: float, Ta: float, Pa: float, aux: 
             b, fb = c, fc
         else:
             a, fa = c, fc
-        if abs(a - b) < 1e-8:           # hi_tol, convergence threshold
+        if abs(a - b) < 1e-3:           # hi_tol, K; 1e-3 K is far below meaningful HI precision
             return c
     return c
 
@@ -421,7 +421,7 @@ def _hi_bisect_T(code: int, x1: float, x2: float, eqvar: float) -> float:
             b, fb = c, fc
         else:
             a, fa = c, fc
-        if abs(a - b) < 1e-8:           # hi_tolT, convergence threshold
+        if abs(a - b) < 1e-3:           # hi_tolT, K; 1e-3 K is far below meaningful HI precision
             return c
     return c
 
