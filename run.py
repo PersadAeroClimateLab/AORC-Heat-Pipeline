@@ -53,7 +53,17 @@ if __name__ == "__main__":
 
     for year in range(1979, 2025):
         print(f"{datetime.now().timestamp()} [compute] Loading data and applying Texas mask for year {year}.")
-        aorc_ds = xr.open_zarr(fs.get_mapper(f"{s3_base_path}{year}.zarr"), consolidated=True).astype(np.float32).where(texas_mask, drop=True)
+        # Rechunk ONCE to a controlled, day-aligned grid: the whole Texas domain
+        # in a single spatial chunk and time in whole-day (24-hour) blocks. This
+        # keeps the chunk/task count small and makes every resample("1D") a clean
+        # per-chunk reduction with no cross-chunk shuffle. All downstream
+        # .chunk('auto') calls are therefore removed.
+        aorc_ds = (
+            xr.open_zarr(fs.get_mapper(f"{s3_base_path}{year}.zarr"), consolidated=True)
+            .astype(np.float32)
+            .where(texas_mask, drop=True)
+            .chunk({"time": 24, "latitude": -1, "longitude": -1})
+        )
 
         
         print(f"{datetime.now().timestamp()} [compute] Calculating heat index metrics for {year}.")
@@ -64,19 +74,19 @@ if __name__ == "__main__":
             dask="parallelized",
             output_dtypes=[float]
         )
-        da = aorc_hi.resample(time="1D").mean().chunk('auto')
+        da = aorc_hi.resample(time="1D").mean()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_heat-index_mean_{year}.zarr"):
             xr.Dataset(data_vars={"heat_index_mean": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_heat-index_mean_{year}.zarr", zarr_format=2
             )
-        da = aorc_hi.resample(time="1D").min().chunk('auto')
+        da = aorc_hi.resample(time="1D").min()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_heat-index_min_{year}.zarr"):
             xr.Dataset(data_vars={"heat_index_min": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_heat-index_min_{year}.zarr", zarr_format=2
             )
-        da = aorc_hi.resample(time="1D").max().chunk('auto')
+        da = aorc_hi.resample(time="1D").max()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_heat-index_max_{year}.zarr"):
             xr.Dataset(data_vars={"heat_index_max": da}, attrs=global_attrs).to_zarr(
@@ -94,20 +104,20 @@ if __name__ == "__main__":
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
             output_dtypes=[float]
-        ).chunk('auto')
-        da = aorc_atemp.resample(time="1D").mean().chunk('auto')
+        )
+        da = aorc_atemp.resample(time="1D").mean()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_apparent-temp_mean_{year}.zarr"):
             xr.Dataset(data_vars={"apparent_temp_mean": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_apparent-temp_mean_{year}.zarr", zarr_format=2
             )
-        da = aorc_atemp.resample(time="1D").min().chunk('auto')
+        da = aorc_atemp.resample(time="1D").min()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_apparent-temp_min_{year}.zarr"):
             xr.Dataset(data_vars={"apparent_temp_min": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_apparent-temp_min_{year}.zarr", zarr_format=2
             )
-        da = aorc_atemp.resample(time="1D").max().chunk('auto')
+        da = aorc_atemp.resample(time="1D").max()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_apparent-temp_max_{year}.zarr"):
             xr.Dataset(data_vars={"apparent_temp_max": da}, attrs=global_attrs).to_zarr(
@@ -123,20 +133,20 @@ if __name__ == "__main__":
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
             output_dtypes=[float]
-        ).chunk('auto')
-        da = aorc_hdex.resample(time="1D").mean().chunk('auto')
+        )
+        da = aorc_hdex.resample(time="1D").mean()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_humidex_mean_{year}.zarr"):
             xr.Dataset(data_vars={"humidex_mean": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_humidex_mean_{year}.zarr", zarr_format=2
             )
-        da = aorc_hdex.resample(time="1D").min().chunk('auto')
+        da = aorc_hdex.resample(time="1D").min()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_humidex_min_{year}.zarr"):
             xr.Dataset(data_vars={"humidex_min": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_humidex_min_{year}.zarr", zarr_format=2
             )
-        da = aorc_hdex.resample(time="1D").max().chunk('auto')
+        da = aorc_hdex.resample(time="1D").max()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_humidex_max_{year}.zarr"):
             xr.Dataset(data_vars={"humidex_max": da}, attrs=global_attrs).to_zarr(
@@ -152,20 +162,20 @@ if __name__ == "__main__":
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
             output_dtypes=[float]
-        ).chunk('auto')
-        da = aorc_swbgt.resample(time="1D").mean().chunk('auto')
+        )
+        da = aorc_swbgt.resample(time="1D").mean()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_swbgt_mean_{year}.zarr"):
             xr.Dataset(data_vars={"swbgt_mean": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_swbgt_mean_{year}.zarr", zarr_format=2
             )
-        da = aorc_swbgt.resample(time="1D").min().chunk('auto')
+        da = aorc_swbgt.resample(time="1D").min()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_swbgt_min_{year}.zarr"):
             xr.Dataset(data_vars={"swbgt_min": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_swbgt_min_{year}.zarr", zarr_format=2
             )
-        da = aorc_swbgt.resample(time="1D").max().chunk('auto')
+        da = aorc_swbgt.resample(time="1D").max()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_swbgt_max_{year}.zarr"):
             xr.Dataset(data_vars={"swbgt_max": da}, attrs=global_attrs).to_zarr(
@@ -180,20 +190,20 @@ if __name__ == "__main__":
             (aorc_ds["TMP_2maboveground"]-273.15),
             dask="parallelized",
             output_dtypes=[float]
-        ).chunk('auto')
-        da = aorc_tas.resample(time="1D").mean().chunk('auto')
+        )
+        da = aorc_tas.resample(time="1D").mean()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_tas_mean_{year}.zarr"):
             xr.Dataset(data_vars={"tas_mean": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_tas_mean_{year}.zarr", zarr_format=2
             )
-        da = aorc_tas.resample(time="1D").min().chunk('auto')
+        da = aorc_tas.resample(time="1D").min()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_tas_min_{year}.zarr"):
             xr.Dataset(data_vars={"tas_min": da}, attrs=global_attrs).to_zarr(
                 f"yearly_metrics_zarrs/AORC_tas_min_{year}.zarr", zarr_format=2
             )
-        da = aorc_tas.resample(time="1D").max().chunk('auto')
+        da = aorc_tas.resample(time="1D").max()
         da.attrs = var_attrs
         if not isdir(f"yearly_metrics_zarrs/AORC_tas_max_{year}.zarr"):
             xr.Dataset(data_vars={"tas_max": da}, attrs=global_attrs).to_zarr(
@@ -209,7 +219,7 @@ if __name__ == "__main__":
             aorc_ds["PRES_surface"],
             dask="parallelized",
             output_dtypes=[float]
-        ).chunk('auto')
+        )
         # Newton-iterated wet-bulb solve; batch the reductions into one dask.compute
         # so the shared `aorc_wbt` nodes are evaluated once instead of per to_zarr.
         daily_wbt = aorc_wbt.resample(time="1D")
@@ -217,7 +227,7 @@ if __name__ == "__main__":
         for reduction, name in (("mean", "wbt_mean"), ("min", "wbt_min"), ("max", "wbt_max")):
             path = f"yearly_metrics_zarrs/AORC_{name}_{year}.zarr"
             if not isdir(path):
-                da = getattr(daily_wbt, reduction)().chunk('auto')
+                da = getattr(daily_wbt, reduction)()
                 da.attrs = var_attrs
                 wbt_writes.append(
                     xr.Dataset(data_vars={name: da}, attrs=global_attrs).to_zarr(
@@ -236,7 +246,7 @@ if __name__ == "__main__":
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
             output_dtypes=[float]
-        ).chunk('auto')
+        )
         # The Romps solve is the most expensive ufunc in the pipeline. Build the
         # three daily reductions as deferred writes and execute them in a single
         # dask.compute so the shared `aorc_rhi` nodes are evaluated only once
@@ -246,7 +256,7 @@ if __name__ == "__main__":
         for reduction, name in (("mean", "rhi_mean"), ("min", "rhi_min"), ("max", "rhi_max")):
             path = f"yearly_metrics_zarrs/AORC_{name}_{year}.zarr"
             if not isdir(path):
-                da = getattr(daily_rhi, reduction)().chunk('auto')
+                da = getattr(daily_rhi, reduction)()
                 da.attrs = var_attrs
                 rhi_writes.append(
                     xr.Dataset(data_vars={name: da}, attrs=global_attrs).to_zarr(
