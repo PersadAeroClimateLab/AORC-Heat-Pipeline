@@ -492,7 +492,7 @@ def get_aorc_wbt(air_temp: float, specific_humid: float, surface_pressure: float
     return celsius_to_fahrenheit(wbt(air_temp, specific_humid, surface_pressure))
 
 
-@nb.njit
+@nb.vectorize
 def get_aorc_romps_heat_index(air_temp: float, specific_humid: float) -> float:
     # air_temp is AORC air temperature in Kelvin; the Romps model expects Kelvin,
     # so it is NOT converted to Celsius here (unlike the other get_aorc_* wrappers).
