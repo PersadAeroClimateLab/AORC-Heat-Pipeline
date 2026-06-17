@@ -53,7 +53,7 @@ ZA_NAKED = np.float32(60.6 / 12.3)                  # Za_un, Pa m^2/W, naked
 HI_MAXITER = 100                                    # bisection iteration cap
 
 
-@nb.njit(cache=True, fastmath=True)
+@nb.njit(cache=True, fastmath=True, inline='always')
 def romps_Qv(Ta: float, Pa: float) -> float:
     """Respiratory heat loss in W/m^2.
 
@@ -69,7 +69,7 @@ def romps_Qv(Ta: float, Pa: float) -> float:
     return eta * METABOLIC_RATE * (cpa * (CORE_TEMP - Ta) + lh * coef * (CORE_VAPOR_PRES - Pa))
 
 
-@nb.njit(cache=True, fastmath=True)
+@nb.njit(cache=True, fastmath=True, inline='always')
 def romps_Zs(Rs: float) -> float:
     """Skin mass-transfer resistance in Pa m^2/W."""
     Rs = np.float32(Rs)
@@ -79,7 +79,7 @@ def romps_Zs(Rs: float) -> float:
     return np.float32(6.0e8) * r2 * r2 * Rs
 
 
-@nb.njit(cache=True, fastmath=True)
+@nb.njit(cache=True, fastmath=True, inline='always')
 def romps_Ra(Ts: float, Ta: float) -> float:
     """Air heat-transfer resistance, exposed skin, K m^2/W."""
     em = EMISSIVITY * np.float32(0.85)
@@ -89,7 +89,7 @@ def romps_Ra(Ts: float, Ta: float) -> float:
     return 1.0 / (np.float32(17.4) + hr)
 
 
-@nb.njit(cache=True, fastmath=True)
+@nb.njit(cache=True, fastmath=True, inline='always')
 def romps_Ra_bar(Tf: float, Ta: float) -> float:
     """Air heat-transfer resistance, clothed skin, K m^2/W."""
     em = EMISSIVITY * np.float32(0.79)
@@ -99,7 +99,7 @@ def romps_Ra_bar(Tf: float, Ta: float) -> float:
     return 1.0 / (np.float32(11.6) + hr)
 
 
-@nb.njit(cache=True, fastmath=True)
+@nb.njit(cache=True, fastmath=True, inline='always')
 def romps_Ra_un(Ts: float, Ta: float) -> float:
     """Air heat-transfer resistance, naked, K m^2/W."""
     em = EMISSIVITY * np.float32(0.80)
@@ -109,36 +109,59 @@ def romps_Ra_un(Ts: float, Ta: float) -> float:
     return 1.0 / (np.float32(12.3) + hr)
 
 
+_ZS0 = np.float32(52.1)
+_CONST_0387 = np.float32(0.0387)
+_CONST_124 = np.float32(124.0)
+
+
+@nb.njit(cache=True, fastmath=True, inline='always')
+def _hi_residual_skin_kind1(x: float, Ta: float, Pa: float) -> float:
+    """Exposed skin (kind=1): energy balance for exposed surface."""
+    return (x - Ta) / romps_Ra(x, Ta) + (CORE_VAPOR_PRES - Pa) / (_ZS0 + ZA_EXPOSED) - (CORE_TEMP - x) / _CONST_0387
+
+
+@nb.njit(cache=True, fastmath=True, inline='always')
+def _hi_residual_skin_kind2(x: float, Ta: float, Pa: float) -> float:
+    """Clothed skin (kind=2): energy balance for clothed surface."""
+    return (x - Ta) / romps_Ra_bar(x, Ta) + (CORE_VAPOR_PRES - Pa) / (_ZS0 + ZA_CLOTHED) - (CORE_TEMP - x) / _CONST_0387
+
+
+@nb.njit(cache=True, fastmath=True, inline='always')
+def _hi_residual_skin_kind3(x: float, Ta: float, Pa: float, Ts_bar: float) -> float:
+    """Region II/III (kind=3): fabric temperature with interaction term."""
+    denom = (_ZS0 + ZA_CLOTHED) * (x - Ta) + _CONST_124 * romps_Ra_bar(x, Ta) * (Ts_bar - x)
+    return (x - Ta) / romps_Ra_bar(x, Ta) + (CORE_VAPOR_PRES - Pa) * (x - Ta) / denom - (CORE_TEMP - Ts_bar) / _CONST_0387
+
+
+@nb.njit(cache=True, fastmath=True, inline='always')
+def _hi_residual_skin_kind4(x: float, Ta: float, Pa: float, QmQv: float) -> float:
+    """Region IV (kind=4): metabolic/vapor balance with skin resistance."""
+    return (x - Ta) / romps_Ra_un(x, Ta) + (CORE_VAPOR_PRES - Pa) / (romps_Zs((CORE_TEMP - x) / QmQv) + ZA_NAKED) - QmQv
+
+
+@nb.njit(cache=True, fastmath=True, inline='always')
+def _hi_residual_skin_kind5(x: float, Ta: float, Pa: float, QmQv: float) -> float:
+    """Region V (kind=5): saturated vapor balance (saturation at skin)."""
+    return (x - Ta) / romps_Ra_un(x, Ta) + (PHI_SALT * romps_pvstar(x) - Pa) / ZA_NAKED - QmQv
+
+
 @nb.njit(cache=True, fastmath=True)
 def _hi_residual_skin(kind: int, x: float, Ta: float, Pa: float, aux: float) -> float:
-    """Skin/clothing energy-balance residuals (replaces the find_eqvar lambdas).
+    """Dispatcher for skin residual functions (branch-free at caller level).
 
     kind: 1 = exposed Ts, 2 = clothed Tf, 3 = region II/III Tf (aux=Ts_bar),
           4 = region IV Ts (aux=QmQv), 5 = region V Ts (aux=QmQv).
     """
-    x = np.float32(x)
-    Ta = np.float32(Ta)
-    Pa = np.float32(Pa)
-    aux = np.float32(aux)
-
-    Zs0 = romps_Zs(np.float32(0.0387))
-    const_0387 = np.float32(0.0387)
-    const_124 = np.float32(124.0)
-
     if kind == 1:
-        return (x - Ta) / romps_Ra(x, Ta) + (CORE_VAPOR_PRES - Pa) / (Zs0 + ZA_EXPOSED) - (CORE_TEMP - x) / const_0387
+        return _hi_residual_skin_kind1(x, Ta, Pa)
     elif kind == 2:
-        return (x - Ta) / romps_Ra_bar(x, Ta) + (CORE_VAPOR_PRES - Pa) / (Zs0 + ZA_CLOTHED) - (CORE_TEMP - x) / const_0387
+        return _hi_residual_skin_kind2(x, Ta, Pa)
     elif kind == 3:
-        Ts_bar = aux
-        denom = (Zs0 + ZA_CLOTHED) * (x - Ta) + const_124 * romps_Ra_bar(x, Ta) * (Ts_bar - x)
-        return (x - Ta) / romps_Ra_bar(x, Ta) + (CORE_VAPOR_PRES - Pa) * (x - Ta) / denom - (CORE_TEMP - Ts_bar) / const_0387
+        return _hi_residual_skin_kind3(x, Ta, Pa, aux)
     elif kind == 4:
-        QmQv = aux
-        return (x - Ta) / romps_Ra_un(x, Ta) + (CORE_VAPOR_PRES - Pa) / (romps_Zs((CORE_TEMP - x) / QmQv) + ZA_NAKED) - QmQv
+        return _hi_residual_skin_kind4(x, Ta, Pa, aux)
     else:  # kind == 5
-        QmQv = aux
-        return (x - Ta) / romps_Ra_un(x, Ta) + (PHI_SALT * romps_pvstar(x) - Pa) / ZA_NAKED - QmQv
+        return _hi_residual_skin_kind5(x, Ta, Pa, aux)
 
 
 @nb.njit(cache=True, fastmath=True)
