@@ -8,15 +8,20 @@ import dask
 import metrics
 from datetime import datetime
 from dask.distributed import LocalCluster, Client
+import dask
+
+# dask.config.set({"array.rechunk.method": "tasks",
+#                 "array.slicing.split_large_chunks": True})
 
 PATH_TO_TEXAS_MASK = "boundary_data/texas_mask.nc"
 PATH_TO_TEXAS_SHP = "boundary_data/texas_shapefile/State_Boundary.shp"
 NUM_THREADS_NUMBA = 2
 
 if __name__ == "__main__":
+    xr.set_options(use_flox=True)
     print(f"{datetime.now().timestamp()} [init] Starting AORC heat analysis pipeline, initiating Dask cluster.")
 
-    cluster = LocalCluster(n_workers=80, threads_per_worker=2, memory_limit="20GB", dashboard_address=":8002")
+    cluster = LocalCluster(n_workers=80, threads_per_worker=2, memory_limit="10GB", dashboard_address=":8002")
     client = cluster.get_client()
     set_num_threads(NUM_THREADS_NUMBA)
     print(client)
@@ -50,18 +55,18 @@ if __name__ == "__main__":
         "source_timestep": "hourly",
         "desc": "Statistic taken across 24 hours"
     }
-
+    
+    lat_keep = np.where(texas_mask.any("longitude").values)[0]
+    lon_keep = np.where(texas_mask.any("latitude").values)[0]
+    lat_slice = slice(int(lat_keep[0]), int(lat_keep[-1]) + 1)
+    lon_slice = slice(int(lon_keep[0]), int(lon_keep[-1]) + 1)
+    mask_bbox  = texas_mask.isel(latitude=lat_slice, longitude=lon_slice)
+    
     for year in range(1979, 2025):
         print(f"{datetime.now().timestamp()} [compute] Loading data and applying Texas mask for year {year}.")
-        # Rechunk ONCE to a controlled, day-aligned grid: the whole Texas domain
-        # in a single spatial chunk and time in whole-day (24-hour) blocks. This
-        # keeps the chunk/task count small and makes every resample("1D") a clean
-        # per-chunk reduction with no cross-chunk shuffle. All downstream
-        # .chunk('auto') calls are therefore removed.
         aorc_ds = (
             xr.open_zarr(fs.get_mapper(f"{s3_base_path}{year}.zarr"), consolidated=True)
-            .astype(np.float32)
-            .where(texas_mask, drop=True)
+            .where(mask_bbox)
             .chunk({"time": 24, "latitude": -1, "longitude": -1})
         )
 
@@ -72,7 +77,7 @@ if __name__ == "__main__":
             aorc_ds["TMP_2maboveground"],
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
-            output_dtypes=[float]
+            output_dtypes=[np.float32]
         )
         da = aorc_hi.resample(time="1D").mean()
         da.attrs = var_attrs
@@ -103,7 +108,7 @@ if __name__ == "__main__":
             aorc_ds["VGRD_10maboveground"],
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
-            output_dtypes=[float]
+            output_dtypes=[np.float32]
         )
         da = aorc_atemp.resample(time="1D").mean()
         da.attrs = var_attrs
@@ -132,7 +137,7 @@ if __name__ == "__main__":
             aorc_ds["TMP_2maboveground"],
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
-            output_dtypes=[float]
+            output_dtypes=[np.float32]
         )
         da = aorc_hdex.resample(time="1D").mean()
         da.attrs = var_attrs
@@ -155,62 +160,6 @@ if __name__ == "__main__":
         del aorc_hdex
 
 
-        print(f"{datetime.now().timestamp()} [compute] Calculating simple wet-bulb globe temperature metrics for {year}.")
-        aorc_swbgt = xr.apply_ufunc(
-            metrics.get_aorc_swbgt,
-            aorc_ds["TMP_2maboveground"],
-            aorc_ds["SPFH_2maboveground"],
-            dask="parallelized",
-            output_dtypes=[float]
-        )
-        da = aorc_swbgt.resample(time="1D").mean()
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_swbgt_mean_{year}.zarr"):
-            xr.Dataset(data_vars={"swbgt_mean": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_swbgt_mean_{year}.zarr", zarr_format=2
-            )
-        da = aorc_swbgt.resample(time="1D").min()
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_swbgt_min_{year}.zarr"):
-            xr.Dataset(data_vars={"swbgt_min": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_swbgt_min_{year}.zarr", zarr_format=2
-            )
-        da = aorc_swbgt.resample(time="1D").max()
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_swbgt_max_{year}.zarr"):
-            xr.Dataset(data_vars={"swbgt_max": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_swbgt_max_{year}.zarr", zarr_format=2
-            )
-        del aorc_swbgt
-
-        
-        print(f"{datetime.now().timestamp()} [compute] Calculating daily 2-meter temperature metrics for {year}.")
-        aorc_tas = xr.apply_ufunc(
-            metrics.celsius_to_fahrenheit,
-            (aorc_ds["TMP_2maboveground"]-273.15),
-            dask="parallelized",
-            output_dtypes=[float]
-        )
-        da = aorc_tas.resample(time="1D").mean()
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_tas_mean_{year}.zarr"):
-            xr.Dataset(data_vars={"tas_mean": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_tas_mean_{year}.zarr", zarr_format=2
-            )
-        da = aorc_tas.resample(time="1D").min()
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_tas_min_{year}.zarr"):
-            xr.Dataset(data_vars={"tas_min": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_tas_min_{year}.zarr", zarr_format=2
-            )
-        da = aorc_tas.resample(time="1D").max()
-        da.attrs = var_attrs
-        if not isdir(f"yearly_metrics_zarrs/AORC_tas_max_{year}.zarr"):
-            xr.Dataset(data_vars={"tas_max": da}, attrs=global_attrs).to_zarr(
-                f"yearly_metrics_zarrs/AORC_tas_max_{year}.zarr", zarr_format=2
-            )
-
-
         print(f"{datetime.now().timestamp()} [compute] Calculating daily wet-bulb temperature metrics for {year}.")
         aorc_wbt = xr.apply_ufunc(
             metrics.get_aorc_wbt,
@@ -218,24 +167,26 @@ if __name__ == "__main__":
             aorc_ds["SPFH_2maboveground"],
             aorc_ds["PRES_surface"],
             dask="parallelized",
-            output_dtypes=[float]
+            output_dtypes=[np.float32]
         )
-        # Newton-iterated wet-bulb solve; batch the reductions into one dask.compute
-        # so the shared `aorc_wbt` nodes are evaluated once instead of per to_zarr.
-        daily_wbt = aorc_wbt.resample(time="1D")
-        wbt_writes = []
-        for reduction, name in (("mean", "wbt_mean"), ("min", "wbt_min"), ("max", "wbt_max")):
-            path = f"yearly_metrics_zarrs/AORC_{name}_{year}.zarr"
-            if not isdir(path):
-                da = getattr(daily_wbt, reduction)()
-                da.attrs = var_attrs
-                wbt_writes.append(
-                    xr.Dataset(data_vars={name: da}, attrs=global_attrs).to_zarr(
-                        path, zarr_format=2, compute=False
-                    )
-                )
-        if wbt_writes:
-            dask.compute(*wbt_writes)
+        da = aorc_wbt.resample(time="1D").mean()
+        da.attrs = var_attrs
+        if not isdir(f"yearly_metrics_zarrs/AORC_wbt_mean_{year}.zarr"):
+            xr.Dataset(data_vars={"wbt_mean": da}, attrs=global_attrs).to_zarr(
+                f"yearly_metrics_zarrs/AORC_wbt_mean_{year}.zarr", zarr_format=2
+            )
+        da = aorc_wbt.resample(time="1D").min()
+        da.attrs = var_attrs
+        if not isdir(f"yearly_metrics_zarrs/AORC_wbt_min_{year}.zarr"):
+            xr.Dataset(data_vars={"wbt_min": da}, attrs=global_attrs).to_zarr(
+                f"yearly_metrics_zarrs/AORC_wbt_min_{year}.zarr", zarr_format=2
+            )
+        da = aorc_wbt.resample(time="1D").max()
+        da.attrs = var_attrs
+        if not isdir(f"yearly_metrics_zarrs/AORC_wbt_max_{year}.zarr"):
+            xr.Dataset(data_vars={"wbt_max": da}, attrs=global_attrs).to_zarr(
+                f"yearly_metrics_zarrs/AORC_wbt_max_{year}.zarr", zarr_format=2
+            )
         del aorc_wbt
 
 
@@ -245,28 +196,27 @@ if __name__ == "__main__":
             aorc_ds["TMP_2maboveground"],
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
-            output_dtypes=[float]
+            output_dtypes=[np.float32]
         )
-        # The Romps solve is the most expensive ufunc in the pipeline. Build the
-        # three daily reductions as deferred writes and execute them in a single
-        # dask.compute so the shared `aorc_rhi` nodes are evaluated only once
-        # (rather than recomputed per to_zarr), while keeping separate stores.
-        daily_rhi = aorc_rhi.resample(time="1D")
-        rhi_writes = []
-        for reduction, name in (("mean", "rhi_mean"), ("min", "rhi_min"), ("max", "rhi_max")):
-            path = f"yearly_metrics_zarrs/AORC_{name}_{year}.zarr"
-            if not isdir(path):
-                da = getattr(daily_rhi, reduction)()
-                da.attrs = var_attrs
-                rhi_writes.append(
-                    xr.Dataset(data_vars={name: da}, attrs=global_attrs).to_zarr(
-                        path, zarr_format=2, compute=False
-                    )
-                )
-        if rhi_writes:
-            dask.compute(*rhi_writes)
+        da = aorc_rhi.resample(time="1D").mean()
+        da.attrs = var_attrs
+        if not isdir(f"yearly_metrics_zarrs/AORC_rhi_mean_{year}.zarr"):
+            xr.Dataset(data_vars={"rhi_mean": da}, attrs=global_attrs).to_zarr(
+                f"yearly_metrics_zarrs/AORC_rhi_mean_{year}.zarr", zarr_format=2
+            )
+        da = aorc_rhi.resample(time="1D").min()
+        da.attrs = var_attrs
+        if not isdir(f"yearly_metrics_zarrs/AORC_rhi_min_{year}.zarr"):
+            xr.Dataset(data_vars={"rhi_min": da}, attrs=global_attrs).to_zarr(
+                f"yearly_metrics_zarrs/AORC_rhi_min_{year}.zarr", zarr_format=2
+            )
+        da = aorc_rhi.resample(time="1D").max()
+        da.attrs = var_attrs
+        if not isdir(f"yearly_metrics_zarrs/AORC_rhi_max_{year}.zarr"):
+            xr.Dataset(data_vars={"rhi_max": da}, attrs=global_attrs).to_zarr(
+                f"yearly_metrics_zarrs/AORC_rhi_max_{year}.zarr", zarr_format=2
+            )
         del aorc_rhi
-    
     print("[final] Computations finished, shutting down Dask cluster.")
 
     client.shutdown()

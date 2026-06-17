@@ -212,7 +212,7 @@ CV_VAPOR = 1418.0           # cvv, specific heat of water vapor, J/kg/K
 CV_LIQUID = 4119.0          # cvl, specific heat of liquid water, J/kg/K
 
 
-@nb.njit
+@nb.njit(inline='always')
 def romps_pvstar(temp: float) -> float:
     """Saturation vapor pressure over liquid/ice in Pa; temp in K."""
     ptrip = 611.65          # triple-point pressure, Pa
@@ -230,7 +230,7 @@ def romps_pvstar(temp: float) -> float:
             * (1.0 / TRIPLE_TEMP - 1.0 / temp))
 
 
-@nb.njit
+@nb.njit(inline='always')
 def romps_latent_heat(temp: float) -> float:
     """Latent heat of vaporization of water in J/kg; temp in K."""
     return E0_VAPOR + (CV_VAPOR - CV_LIQUID) * (temp - TRIPLE_TEMP) + RGAS_VAPOR * temp
@@ -251,7 +251,7 @@ ZA_NAKED = 60.6 / 12.3                              # Za_un, Pa m^2/W, naked
 HI_MAXITER = 100                                    # bisection iteration cap
 
 
-@nb.njit
+@nb.njit(inline='always')
 def romps_Qv(Ta: float, Pa: float) -> float:
     """Respiratory heat loss in W/m^2.
 
@@ -265,7 +265,7 @@ def romps_Qv(Ta: float, Pa: float) -> float:
         * (CORE_VAPOR_PRES - Pa))
 
 
-@nb.njit
+@nb.njit(inline='always')
 def romps_Zs(Rs: float) -> float:
     """Skin mass-transfer resistance in Pa m^2/W."""
     return 52.1 if Rs == 0.0387 else 6.0e8 * Rs ** 5
@@ -278,21 +278,21 @@ def romps_Ra(Ts: float, Ta: float) -> float:
     return 1.0 / (17.4 + hr)
 
 
-@nb.njit
+@nb.njit(inline='always')
 def romps_Ra_bar(Tf: float, Ta: float) -> float:
     """Air heat-transfer resistance, clothed skin, K m^2/W."""
     hr = EMISSIVITY * 0.79 * STEFAN_BOLTZMANN * (Tf ** 2 + Ta ** 2) * (Tf + Ta)
     return 1.0 / (11.6 + hr)
 
 
-@nb.njit
+@nb.njit(inline='always')
 def romps_Ra_un(Ts: float, Ta: float) -> float:
     """Air heat-transfer resistance, naked, K m^2/W."""
     hr = EMISSIVITY * 0.80 * STEFAN_BOLTZMANN * (Ts ** 2 + Ta ** 2) * (Ts + Ta)
     return 1.0 / (12.3 + hr)
 
 
-@nb.njit
+@nb.njit(inline='always')
 def _hi_residual_skin(kind: int, x: float, Ta: float, Pa: float, aux: float) -> float:
     """Skin/clothing energy-balance residuals (replaces the find_eqvar lambdas).
 
@@ -318,7 +318,7 @@ def _hi_residual_skin(kind: int, x: float, Ta: float, Pa: float, aux: float) -> 
         return (x - Ta) / romps_Ra_un(x, Ta) + (PHI_SALT * romps_pvstar(x) - Pa) / ZA_NAKED - QmQv
 
 
-@nb.njit
+@nb.njit(inline='always')
 def _hi_bisect_skin(kind: int, x1: float, x2: float, Ta: float, Pa: float, aux: float) -> float:
     a, b = x1, x2
     fa = _hi_residual_skin(kind, a, Ta, Pa, aux)
@@ -338,7 +338,7 @@ def _hi_bisect_skin(kind: int, x1: float, x2: float, Ta: float, Pa: float, aux: 
     return c
 
 
-@nb.njit
+@nb.njit(inline='always')
 def romps_find_eqvar(Ta: float, RH: float):
     """Equivalent-variable solver. Returns (code, phi, Rf, Rs, dTcdt).
 
@@ -392,7 +392,7 @@ def romps_find_eqvar(Ta: float, RH: float):
     return (code, phi, Rf, Rs, dTcdt)
 
 
-@nb.njit
+@nb.njit(inline='always')
 def _hi_residual_T(code: int, T: float, eqvar: float) -> float:
     """Heat-index temperature residual (replaces the find_T lambdas)."""
     Pa0 = 1.6e3             # reference air vapor pressure, Pa
@@ -406,7 +406,7 @@ def _hi_residual_T(code: int, T: float, eqvar: float) -> float:
         return romps_find_eqvar(T, Pa0 / romps_pvstar(T))[4] - eqvar
 
 
-@nb.njit
+@nb.njit(inline='always')
 def _hi_bisect_T(code: int, x1: float, x2: float, eqvar: float) -> float:
     a, b = x1, x2
     fa = _hi_residual_T(code, a, eqvar)
@@ -426,7 +426,7 @@ def _hi_bisect_T(code: int, x1: float, x2: float, eqvar: float) -> float:
     return c
 
 
-@nb.njit
+@nb.njit(inline='always')
 def romps_heatindex(Ta: float, RH: float) -> float:
     """
     Calculates the extended heat index of Lu & Romps (2022).
@@ -492,7 +492,7 @@ def get_aorc_wbt(air_temp: float, specific_humid: float, surface_pressure: float
     return celsius_to_fahrenheit(wbt(air_temp, specific_humid, surface_pressure))
 
 
-@nb.vectorize
+@nb.njit(inline='always', parallel=True, fastmath=True)
 def get_aorc_romps_heat_index(air_temp: float, specific_humid: float) -> float:
     # air_temp is AORC air temperature in Kelvin; the Romps model expects Kelvin,
     # so it is NOT converted to Celsius here (unlike the other get_aorc_* wrappers).
