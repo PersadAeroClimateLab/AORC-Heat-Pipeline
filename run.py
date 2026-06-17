@@ -6,6 +6,7 @@ import numpy as np
 import s3fs
 import dask
 import metrics
+import romps_heat_index as rhi
 from datetime import datetime
 from dask.distributed import LocalCluster, Client
 import dask
@@ -192,7 +193,7 @@ if __name__ == "__main__":
 
         print(f"{datetime.now().timestamp()} [compute] Calculating daily Romps heat-index metrics for {year}.")
         aorc_rhi = xr.apply_ufunc(
-            metrics.get_aorc_romps_heat_index,
+            rhi.get_aorc_romps_heat_index,
             aorc_ds["TMP_2maboveground"],
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
