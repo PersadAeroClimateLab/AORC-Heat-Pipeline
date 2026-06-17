@@ -307,9 +307,16 @@ def _celsius_to_fahrenheit(temp_c: float) -> float:
     return (temp_c * np.float32(1.8)) + np.float32(32.0)
 
 
-@nb.njit(cache=True, fastmath=True)
-def get_aorc_romps_heat_index_scalar(air_temp: float, specific_humid: float) -> float:
-    """Scalar Romps heat index (for use by vectorized wrapper)."""
+@nb.vectorize(cache=True, fastmath=True)
+def get_aorc_romps_heat_index(air_temp: float, specific_humid: float) -> float:
+    """
+    Calculates the extended Romps (2022) heat index from AORC data.
+    Handles both scalar and array inputs via Numba vectorization.
+
+    :param air_temp: Air temperature in Kelvin (scalar or array)
+    :param specific_humid: Specific humidity in kg/kg (scalar or array)
+    :return: Heat index in degrees Fahrenheit (scalar or array)
+    """
     if air_temp < np.float32(270.0) or specific_humid < np.float32(0.0):
         return air_temp
 
@@ -326,19 +333,3 @@ def get_aorc_romps_heat_index_scalar(air_temp: float, specific_humid: float) -> 
 
     hi_kelvin = romps_heatindex(air_temp, rel_humid)
     return _celsius_to_fahrenheit(hi_kelvin - TRIPLE_TEMP)
-
-
-def get_aorc_romps_heat_index(air_temp, specific_humid):
-    """
-    Calculates the extended Romps (2022) heat index from AORC data.
-    Handles both scalar and array inputs via Numba vectorization.
-
-    :param air_temp: Air temperature in Kelvin (scalar or array)
-    :param specific_humid: Specific humidity in kg/kg (scalar or array)
-    :return: Heat index in degrees Fahrenheit (scalar or array)
-    """
-    import numpy as _np
-    if _np.isscalar(air_temp) and _np.isscalar(specific_humid):
-        return get_aorc_romps_heat_index_scalar(float(air_temp), float(specific_humid))
-    else:
-        return _np.vectorize(get_aorc_romps_heat_index_scalar)(air_temp, specific_humid)
