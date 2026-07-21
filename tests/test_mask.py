@@ -42,6 +42,42 @@ def test_mask_from_polygon_has_grid_dimensions():
     assert float(selected.latitude.max()) <= 1.0
 
 
+def test_mask_from_polygon_does_not_transpose_lat_lon_axes():
+    # test_mask_from_polygon_has_grid_dimensions uses the same array for both
+    # latitudes and longitudes against a symmetric unit square, so it cannot
+    # detect a row/column (lat/lon) swap -- a transposed implementation would
+    # produce byte-identical output on that test. Here the grid axes have
+    # different lengths and different ranges, and the polygon is a rectangle
+    # that is wide in longitude but narrow in latitude, with a longitude
+    # range that does not overlap the latitude range at all. If latitude and
+    # longitude were ever swapped internally, the selected cells would land
+    # outside the ranges asserted below (or the mask would select nothing).
+    latitudes = np.linspace(10.0, 12.0, 5, dtype=np.float64)
+    longitudes = np.linspace(-100.0, -90.0, 21, dtype=np.float64)
+    rectangle = np.array(
+        [
+            [-98.0, 10.5],
+            [-98.0, 11.5],
+            [-92.0, 11.5],
+            [-92.0, 10.5],
+            [-98.0, 10.5],
+        ]
+    )
+
+    result = mask_module.mask_from_polygon(latitudes, longitudes, rectangle)
+
+    assert result.dims == ("latitude", "longitude")
+    assert result.shape == (5, 21)
+    selected = result.where(result, drop=True)
+    assert selected.latitude.size > 0
+    assert selected.longitude.size > 0
+    # Selected cells must fall within the rectangle's per-axis ranges.
+    assert float(selected.latitude.min()) >= 10.5
+    assert float(selected.latitude.max()) <= 11.5
+    assert float(selected.longitude.min()) >= -98.0
+    assert float(selected.longitude.max()) <= -92.0
+
+
 def test_crop_to_bounding_box_trims_empty_margins():
     latitudes = np.arange(10.0, 20.0)
     longitudes = np.arange(100.0, 110.0)

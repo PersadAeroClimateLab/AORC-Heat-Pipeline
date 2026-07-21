@@ -56,16 +56,19 @@ def point_in_polygon(longitude, latitude, polygon):
     previous_longitude, previous_latitude = polygon[0]
     for index in range(vertex_count + 1):
         current_longitude, current_latitude = polygon[index % vertex_count]
+        # This gate (strictly greater than the lower latitude, less-than-or-
+        # equal to the upper one) can never be satisfied when the edge is
+        # horizontal (previous_latitude == current_latitude), since min ==
+        # max there and no value is both > and <= the same number. Horizontal
+        # edges are therefore excluded by this check alone and need no
+        # special-cased handling below.
         if latitude > min(previous_latitude, current_latitude):
             if latitude <= max(previous_latitude, current_latitude):
                 if longitude <= max(previous_longitude, current_longitude):
-                    if previous_latitude != current_latitude:
-                        crossing = (latitude - previous_latitude) * (
-                            current_longitude - previous_longitude
-                        ) / (current_latitude - previous_latitude) + previous_longitude
-                        if previous_longitude == current_longitude or longitude <= crossing:
-                            inside = not inside
-                    elif previous_longitude == current_longitude:
+                    crossing = (latitude - previous_latitude) * (
+                        current_longitude - previous_longitude
+                    ) / (current_latitude - previous_latitude) + previous_longitude
+                    if previous_longitude == current_longitude or longitude <= crossing:
                         inside = not inside
         previous_longitude, previous_latitude = current_longitude, current_latitude
     return inside
