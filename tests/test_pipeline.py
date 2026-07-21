@@ -89,6 +89,57 @@ def test_daily_metrics_reduction_matches_manual_numpy(synthetic_aorc_dataset):
         )
 
 
+def test_daily_metrics_heat_index_matches_manual_numpy(synthetic_aorc_dataset):
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["heat_index"]).compute()
+
+    loaded = synthetic_aorc_dataset.compute()
+    air_temperature_celsius = core.kelvin_to_celsius(loaded["TMP_2maboveground"].values)
+    air_temperature_fahrenheit = core.celsius_to_fahrenheit(air_temperature_celsius)
+    air_pressure_hpa = (loaded["PRES_surface"].values / 100.0).astype(np.float32)
+    vapor = core.vapor_pressure(loaded["SPFH_2maboveground"].values, air_pressure_hpa)
+    saturation = core.saturation_vapor_pressure(air_temperature_celsius)
+    relative_humidity = core.relative_humidity(vapor, saturation)
+    hourly = core.heat_index(air_temperature_fahrenheit, relative_humidity)
+
+    for day in (0, 1):
+        window = hourly[day * 24 : (day + 1) * 24]
+        np.testing.assert_allclose(
+            result["heat_index_min"].isel(time=day).values, window.min(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["heat_index_mean"].isel(time=day).values, window.mean(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["heat_index_max"].isel(time=day).values, window.max(axis=0), rtol=1e-5
+        )
+
+
+def test_daily_metrics_apparent_temperature_matches_manual_numpy(synthetic_aorc_dataset):
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["apparent_temperature"]).compute()
+
+    loaded = synthetic_aorc_dataset.compute()
+    air_temperature_celsius = core.kelvin_to_celsius(loaded["TMP_2maboveground"].values)
+    air_pressure_hpa = (loaded["PRES_surface"].values / 100.0).astype(np.float32)
+    vapor = core.vapor_pressure(loaded["SPFH_2maboveground"].values, air_pressure_hpa)
+    wind_speed = np.sqrt(
+        loaded["UGRD_10maboveground"].values ** 2 + loaded["VGRD_10maboveground"].values ** 2
+    )
+    hourly_celsius = core.apparent_temperature(air_temperature_celsius, vapor, wind_speed)
+    hourly = core.celsius_to_fahrenheit(hourly_celsius)
+
+    for day in (0, 1):
+        window = hourly[day * 24 : (day + 1) * 24]
+        np.testing.assert_allclose(
+            result["apparent_temperature_min"].isel(time=day).values, window.min(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["apparent_temperature_mean"].isel(time=day).values, window.mean(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["apparent_temperature_max"].isel(time=day).values, window.max(axis=0), rtol=1e-5
+        )
+
+
 def test_daily_metrics_orders_statistics_min_le_mean_le_max(synthetic_aorc_dataset):
     result = pipeline.daily_metrics(synthetic_aorc_dataset, ALL_METRICS).compute()
     for name in ALL_METRICS:
