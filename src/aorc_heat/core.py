@@ -247,3 +247,86 @@ def simplified_wbgt(air_temperature_celsius: float, vapor_pressure_hpa: float) -
         + np.float32(0.393) * np.float32(vapor_pressure_hpa)
         + np.float32(3.94)
     )
+
+
+WET_BULB_MAX_ITERATIONS = 50
+WET_BULB_TOLERANCE_CELSIUS = np.float32(1.0e-4)
+
+#: Largest wet-bulb depression the solver will accept, in degrees Celsius. Acts
+#: as a guard rail so a Newton step cannot run away on pathological input.
+WET_BULB_MAX_DEPRESSION_CELSIUS = np.float32(40.0)
+
+SPECIFIC_HEAT_DRY_AIR = np.float32(1005.7)    # J/kg/K
+SPECIFIC_HEAT_WATER_VAPOR = np.float32(1875.0)  # J/kg/K
+LATENT_HEAT_AT_ZERO_CELSIUS = np.float32(2.501e6)  # J/kg
+LATENT_HEAT_SLOPE = np.float32(-2370.0)       # J/kg per degree Celsius
+
+
+@nb.vectorize(target="cpu", cache=True, fastmath=True)
+def wet_bulb_temperature(
+    air_temperature_celsius: float, specific_humidity: float, air_pressure_hpa: float
+) -> float:
+    """Thermodynamic (isobaric) wet-bulb temperature by Newton iteration.
+
+    Solves the psychrometric energy balance
+
+        cp_moist * (T - Tw) = L(Tw) * (qs(Tw, p) - q)
+
+    for Tw, i.e. the root of f(Tw) = qs(Tw) - q - (cp/L(Tw)) * (T - Tw), with
+    f'(Tw) = dqs/dTw + cp/L + (T - Tw) * cp * (dL/dT) / L**2.
+
+    Converges in roughly three to five iterations from the initial guess
+    Tw = T; f is monotonic in Tw and f(T) >= 0 for sub-saturated air. For
+    saturated air the solution is Tw == T.
+
+    :param air_temperature_celsius: Air temperature in degrees Celsius
+    :param specific_humidity: Specific humidity in kg/kg
+    :param air_pressure_hpa: Total air pressure in hPa
+    :return: Wet-bulb temperature in degrees Celsius
+    """
+    temperature = np.float32(air_temperature_celsius)
+    humidity = np.float32(specific_humidity)
+    pressure = np.float32(air_pressure_hpa)
+
+    epsilon = DRY_AIR_TO_VAPOR_MOLAR_MASS_RATIO
+    one_minus_epsilon = np.float32(1.0) - epsilon
+    specific_heat_moist_air = SPECIFIC_HEAT_DRY_AIR + (
+        SPECIFIC_HEAT_WATER_VAPOR - SPECIFIC_HEAT_DRY_AIR
+    ) * humidity
+
+    wet_bulb = temperature
+
+    for _ in range(WET_BULB_MAX_ITERATIONS):
+        latent_heat = LATENT_HEAT_AT_ZERO_CELSIUS + LATENT_HEAT_SLOPE * wet_bulb
+        saturation = saturation_vapor_pressure(wet_bulb)
+        saturation_slope = saturation_vapor_pressure_slope(wet_bulb)
+
+        denominator = pressure - one_minus_epsilon * saturation
+        saturation_humidity = epsilon * saturation / denominator
+        saturation_humidity_slope = (
+            epsilon * pressure * saturation_slope / (denominator * denominator)
+        )
+
+        heat_ratio = specific_heat_moist_air / latent_heat
+        residual = saturation_humidity - humidity - heat_ratio * (temperature - wet_bulb)
+        residual_slope = (
+            saturation_humidity_slope
+            + heat_ratio
+            + (temperature - wet_bulb)
+            * specific_heat_moist_air
+            * LATENT_HEAT_SLOPE
+            / (latent_heat * latent_heat)
+        )
+
+        step = residual / residual_slope
+        wet_bulb -= step
+
+        if wet_bulb > temperature:
+            wet_bulb = temperature
+        elif wet_bulb < temperature - WET_BULB_MAX_DEPRESSION_CELSIUS:
+            wet_bulb = temperature - WET_BULB_MAX_DEPRESSION_CELSIUS
+
+        if abs(step) < WET_BULB_TOLERANCE_CELSIUS:
+            break
+
+    return wet_bulb

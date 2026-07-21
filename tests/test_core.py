@@ -220,3 +220,39 @@ def test_humidex_equals_air_temperature_at_reference_vapor_pressure():
 def test_simplified_wbgt():
     # sWBGT = 0.567*T + 0.393*e + 3.94  ->  14.175 + 7.86 + 3.94 = 25.975
     assert core.simplified_wbgt(25.0, 20.0) == pytest.approx(25.975, rel=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Wet-bulb temperature (psychrometric Newton iteration)
+# ---------------------------------------------------------------------------
+def _specific_humidity_at(relative_humidity_fraction, air_temperature_celsius, air_pressure_hpa):
+    """Specific humidity for a given RH, using the same relation as core."""
+    epsilon = 0.622
+    vapor = relative_humidity_fraction * core.saturation_vapor_pressure(air_temperature_celsius)
+    return epsilon * vapor / (air_pressure_hpa - (1.0 - epsilon) * vapor)
+
+
+def test_wet_bulb_temperature_stull_reference():
+    # T = 25 C, RH = 50%, p = 1013.25 hPa. Stull (2011) gives Tw ~= 18.0 C.
+    pressure = 1013.25
+    humidity = _specific_humidity_at(0.5, 25.0, pressure)
+    assert core.wet_bulb_temperature(25.0, humidity, pressure) == pytest.approx(18.0, abs=0.7)
+
+
+@pytest.mark.parametrize("air_temperature_celsius", [10.0, 20.0, 30.0])
+def test_wet_bulb_temperature_equals_air_temperature_at_saturation(air_temperature_celsius):
+    pressure = 1013.25
+    humidity = _specific_humidity_at(1.0, air_temperature_celsius, pressure)
+    result = core.wet_bulb_temperature(air_temperature_celsius, humidity, pressure)
+    assert result == pytest.approx(air_temperature_celsius, abs=0.05)
+
+
+@pytest.mark.parametrize("specific_humidity", [0.001, 0.005, 0.01, 0.015])
+def test_wet_bulb_temperature_never_exceeds_air_temperature(specific_humidity):
+    assert core.wet_bulb_temperature(25.0, specific_humidity, 1013.25) <= 25.0 + 1e-4
+
+
+def test_wet_bulb_temperature_lower_in_drier_air():
+    humid = core.wet_bulb_temperature(25.0, 0.012, 1013.25)
+    dry = core.wet_bulb_temperature(25.0, 0.004, 1013.25)
+    assert dry < humid
