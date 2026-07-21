@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "aorc-heat"
+version = "0.1.0"
+description = "Heat-stress metrics derived from the NOAA AORC hourly reanalysis archive"
+requires-python = ">=3.11"
+dynamic = ["dependencies"]
+
+[project.scripts]
+aorc-heat = "aorc_heat.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.dynamic]
+dependencies = { file = ["requirements.txt"] }
