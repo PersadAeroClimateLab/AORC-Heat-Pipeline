@@ -256,3 +256,51 @@ def test_wet_bulb_temperature_lower_in_drier_air():
     humid = core.wet_bulb_temperature(25.0, 0.012, 1013.25)
     dry = core.wet_bulb_temperature(25.0, 0.004, 1013.25)
     assert dry < humid
+
+
+# ---------------------------------------------------------------------------
+# NaN propagation and pathological-input coverage
+#
+# The pipeline masks to the Texas region with xarray's `.where(mask)`, which
+# produces NaN for every out-of-region cell. NaN must pass through as NaN
+# rather than clamp to a finite edge -- see the fastmath flags on
+# `wet_bulb_temperature` in core.py for the mechanism that used to violate
+# this (LLVM's `nnan` flag let the depression clamp collapse onto a NaN
+# iterate and overwrite it with `T - WET_BULB_MAX_DEPRESSION_CELSIUS`).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    "air_temperature_celsius, specific_humidity, air_pressure_hpa",
+    [
+        (np.nan, 0.01, 1013.25),   # NaN temperature alone
+        (25.0, np.nan, 1013.25),   # NaN humidity alone
+        (25.0, 0.01, np.nan),      # NaN pressure alone
+        (np.nan, np.nan, np.nan),  # NaN in all three arguments
+    ],
+)
+def test_wet_bulb_temperature_propagates_nan(
+    air_temperature_celsius, specific_humidity, air_pressure_hpa
+):
+    result = core.wet_bulb_temperature(
+        air_temperature_celsius, specific_humidity, air_pressure_hpa
+    )
+    assert np.isnan(result)
+
+
+def test_wet_bulb_temperature_supersaturated_equals_air_temperature():
+    # RH slightly above 100% happens routinely from float noise (fog, rain,
+    # saturated boundary layers) across a multi-decade CONUS-scale hourly
+    # dataset. The physical answer is still Tw == T; same tolerance as the
+    # exact-saturation test above.
+    pressure = 1013.25
+    temperature = 25.0
+    humidity = _specific_humidity_at(1.0001, temperature, pressure)
+    result = core.wet_bulb_temperature(temperature, humidity, pressure)
+    assert result == pytest.approx(temperature, abs=0.05)
+
+
+def test_wet_bulb_temperature_zero_humidity_is_finite_and_bounded():
+    # Bone-dry air (q = 0) is a boundary input, not a NaN one: the solver
+    # must still return a finite value at or below the air temperature.
+    result = core.wet_bulb_temperature(25.0, 0.0, 1013.25)
+    assert np.isfinite(result)
+    assert result <= 25.0 + 1e-4

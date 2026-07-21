@@ -262,7 +262,20 @@ LATENT_HEAT_AT_ZERO_CELSIUS = np.float32(2.501e6)  # J/kg
 LATENT_HEAT_SLOPE = np.float32(-2370.0)       # J/kg per degree Celsius
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+#: Fast-math flags for `wet_bulb_temperature`, deliberately omitting `nnan` and
+#: `ninf`. With plain `fastmath=True` (which sets `nnan`), LLVM is permitted to
+#: assume no operand is ever NaN; that license lets it collapse the branch that
+#: clamps the iterate against the depression bound so that a NaN iterate takes
+#: the "clamp to bound" arm unconditionally, silently replacing NaN with a
+#: finite number. The pipeline relies on NaN passing through this function
+#: untouched (out-of-region cells arrive as NaN via xarray's `.where` mask), so
+#: `nnan` cannot be set here. `ninf` is dropped too, since the division by
+#: `residual_slope` can legitimately produce infinities. The remaining flags
+#: still give most of the fastmath speedup without licensing this collapse.
+WET_BULB_FASTMATH_FLAGS = {"nsz", "arcp", "contract", "afn", "reassoc"}
+
+
+@nb.vectorize(target="cpu", cache=True, fastmath=WET_BULB_FASTMATH_FLAGS)
 def wet_bulb_temperature(
     air_temperature_celsius: float, specific_humidity: float, air_pressure_hpa: float
 ) -> float:
@@ -297,6 +310,8 @@ def wet_bulb_temperature(
     wet_bulb = temperature
 
     for _ in range(WET_BULB_MAX_ITERATIONS):
+        previous_wet_bulb = wet_bulb
+
         latent_heat = LATENT_HEAT_AT_ZERO_CELSIUS + LATENT_HEAT_SLOPE * wet_bulb
         saturation = saturation_vapor_pressure(wet_bulb)
         saturation_slope = saturation_vapor_pressure_slope(wet_bulb)
@@ -327,6 +342,18 @@ def wet_bulb_temperature(
             wet_bulb = temperature - WET_BULB_MAX_DEPRESSION_CELSIUS
 
         if abs(step) < WET_BULB_TOLERANCE_CELSIUS:
+            break
+
+        # A raw Newton step can be far larger than the clamp range, so the
+        # clamped iterate can sit at the same bound for many iterations while
+        # `step` itself never shrinks below tolerance (the pre-clamp value is
+        # what shrinks in a normal convergence, but here it can't -- the true
+        # root lies outside [T - 40, T]). Detect that stall directly: if the
+        # iterate is bit-identical to what it was at the top of this
+        # iteration, it is provably stationary (a step that merely overshot
+        # and got clamped once, then moves again next iteration as it
+        # recovers, so this does not fire for that case).
+        if wet_bulb == previous_wet_bulb:
             break
 
     return wet_bulb
