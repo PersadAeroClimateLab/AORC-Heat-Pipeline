@@ -143,3 +143,107 @@ def relative_humidity(vapor_pressure_hpa: float, saturation_vapor_pressure_hpa: 
     return (
         np.float32(vapor_pressure_hpa) / np.float32(saturation_vapor_pressure_hpa)
     ) * np.float32(100.0)
+
+
+@nb.vectorize(target="cpu", cache=True, fastmath=True)
+def heat_index(air_temperature_fahrenheit: float, relative_humidity_percent: float) -> float:
+    """Heat index from the National Weather Service Rothfusz regression.
+
+    Below roughly 80 F the simple Steadman form is returned directly. Above it
+    the full regression applies, with the low- and high-humidity corrections.
+    Stated accuracy is +/- 1.3 F.
+    https://www.wpc.ncep.noaa.gov/html/heatindex_equation.shtml
+
+    :param air_temperature_fahrenheit: Temperature in degrees Fahrenheit
+    :param relative_humidity_percent: Relative humidity from 0 (dry) to 100 (saturated)
+    :return: Heat index in degrees Fahrenheit
+    """
+    temperature = np.float32(air_temperature_fahrenheit)
+    humidity = np.float32(relative_humidity_percent)
+
+    index = np.float32(0.5) * (
+        temperature
+        + np.float32(61.0)
+        + ((temperature - np.float32(68.0)) * np.float32(1.2))
+        + (humidity * np.float32(0.094))
+    )
+
+    if index > np.float32(80.0):
+        temperature_squared = temperature * temperature
+        humidity_squared = humidity * humidity
+        cross_term = temperature * humidity
+
+        index = np.float32(-42.379)
+        index += np.float32(2.04901523) * temperature
+        index += np.float32(10.14333127) * humidity
+        index += np.float32(-0.22475541) * cross_term
+        index += np.float32(-0.00683783) * temperature_squared
+        index += np.float32(-0.05481717) * humidity_squared
+        index += np.float32(0.00122874) * temperature_squared * humidity
+        index += np.float32(0.00085282) * temperature * humidity_squared
+        index += np.float32(-0.00000199) * cross_term * cross_term
+
+        if humidity < np.float32(13.0) and np.float32(80.0) <= temperature <= np.float32(112.0):
+            span = np.float32(17.0) - np.abs(temperature - np.float32(95.0))
+            index -= ((np.float32(13.0) - humidity) / np.float32(4.0)) * np.sqrt(
+                np.abs(span / np.float32(17.0))
+            )
+        elif humidity > np.float32(85.0) and np.float32(80.0) <= temperature <= np.float32(87.0):
+            index += ((humidity - np.float32(85.0)) / np.float32(10.0)) * (
+                (np.float32(87.0) - temperature) / np.float32(5.0)
+            )
+
+    return index
+
+
+@nb.vectorize(target="cpu", cache=True, fastmath=True)
+def apparent_temperature(
+    air_temperature_celsius: float, vapor_pressure_hpa: float, wind_speed_ms: float
+) -> float:
+    """Steadman apparent temperature.
+
+    AT = T + 0.33*e - 0.70*ws - 4.00
+
+    :param air_temperature_celsius: Temperature in degrees Celsius
+    :param vapor_pressure_hpa: Vapour pressure in hPa
+    :param wind_speed_ms: Wind speed in metres per second
+    :return: Apparent temperature in degrees Celsius
+    """
+    return (
+        np.float32(air_temperature_celsius)
+        + np.float32(0.33) * np.float32(vapor_pressure_hpa)
+        - np.float32(0.7) * np.float32(wind_speed_ms)
+        - np.float32(4.0)
+    )
+
+
+@nb.vectorize(target="cpu", cache=True, fastmath=True)
+def humidex(air_temperature_celsius: float, vapor_pressure_hpa: float) -> float:
+    """Canadian humidex.
+
+    H = T + (5/9)*(e - 10)
+
+    :param air_temperature_celsius: Temperature in degrees Celsius
+    :param vapor_pressure_hpa: Vapour pressure in hPa
+    :return: Humidex in degrees Celsius
+    """
+    return np.float32(air_temperature_celsius) + np.float32(5.0) / np.float32(9.0) * (
+        np.float32(vapor_pressure_hpa) - np.float32(10.0)
+    )
+
+
+@nb.vectorize(target="cpu", cache=True, fastmath=True)
+def simplified_wbgt(air_temperature_celsius: float, vapor_pressure_hpa: float) -> float:
+    """ACSM simplified wet-bulb globe temperature.
+
+    sWBGT = 0.567*T + 0.393*e + 3.94
+
+    :param air_temperature_celsius: Temperature in degrees Celsius
+    :param vapor_pressure_hpa: Vapour pressure in hPa
+    :return: Simplified wet-bulb globe temperature in degrees Celsius
+    """
+    return (
+        np.float32(0.567) * np.float32(air_temperature_celsius)
+        + np.float32(0.393) * np.float32(vapor_pressure_hpa)
+        + np.float32(3.94)
+    )

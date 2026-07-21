@@ -140,3 +140,83 @@ def test_relative_humidity_saturated_air_is_100_percent():
 def test_relative_humidity_half_saturated():
     saturation = core.saturation_vapor_pressure(25.0)
     assert core.relative_humidity(0.5 * saturation, saturation) == pytest.approx(50.0, rel=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Heat index (NWS Rothfusz regression)
+# ---------------------------------------------------------------------------
+# Values read from the NWS heat-index chart, 40% relative-humidity column.
+NWS_CHART_40_PERCENT = [
+    (80.0, 40.0, 80.0),
+    (90.0, 40.0, 91.0),
+    (96.0, 40.0, 101.0),
+    (100.0, 40.0, 109.0),
+    (104.0, 40.0, 119.0),
+    (110.0, 40.0, 136.0),
+]
+
+
+@pytest.mark.parametrize(
+    "air_temperature_fahrenheit, relative_humidity_percent, expected",
+    NWS_CHART_40_PERCENT,
+)
+def test_heat_index_matches_nws_chart(
+    air_temperature_fahrenheit, relative_humidity_percent, expected
+):
+    # +/- 2 F absorbs chart rounding plus the regression's stated +/- 1.3 F error.
+    result = core.heat_index(air_temperature_fahrenheit, relative_humidity_percent)
+    assert result == pytest.approx(expected, abs=2.0)
+
+
+def test_heat_index_high_humidity_adjustment():
+    # T in [80, 87] with RH > 85 triggers the high-humidity correction.
+    # The NWS chart gives ~105 F at 86 F / 90% RH.
+    assert core.heat_index(86.0, 90.0) == pytest.approx(105.0, abs=2.0)
+
+
+def test_heat_index_low_humidity_adjustment():
+    # RH < 13 with 80 <= T <= 112 triggers the low-humidity correction. Hand
+    # evaluation of the Rothfusz regression plus adjustment gives ~89.4 F.
+    assert core.heat_index(95.0, 10.0) == pytest.approx(89.4, abs=1.0)
+
+
+def test_heat_index_uses_simple_formula_below_threshold():
+    # Below 80 F the simple Steadman form is returned without the regression.
+    air_temperature_fahrenheit, relative_humidity_percent = 75.0, 40.0
+    expected = 0.5 * (
+        air_temperature_fahrenheit
+        + 61.0
+        + ((air_temperature_fahrenheit - 68.0) * 1.2)
+        + (relative_humidity_percent * 0.094)
+    )
+    assert expected < 80.0
+    result = core.heat_index(air_temperature_fahrenheit, relative_humidity_percent)
+    assert result == pytest.approx(expected, rel=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# Apparent temperature (Steadman), humidex, simplified WBGT
+# ---------------------------------------------------------------------------
+def test_apparent_temperature():
+    # AT = T + 0.33*e - 0.70*ws - 4.00  ->  25 + 6.6 - 3.5 - 4 = 24.1
+    assert core.apparent_temperature(25.0, 20.0, 5.0) == pytest.approx(24.1, rel=1e-5)
+
+
+def test_apparent_temperature_wind_lowers_result():
+    calm = core.apparent_temperature(30.0, 15.0, 0.0)
+    windy = core.apparent_temperature(30.0, 15.0, 10.0)
+    assert windy < calm
+
+
+def test_humidex():
+    # H = T + (5/9)*(e - 10)  ->  30 + (5/9)*20 = 41.1111
+    assert core.humidex(30.0, 30.0) == pytest.approx(41.1111111, rel=1e-5)
+
+
+def test_humidex_equals_air_temperature_at_reference_vapor_pressure():
+    assert core.humidex(28.0, 10.0) == pytest.approx(28.0, rel=1e-5)
+
+
+def test_simplified_wbgt():
+    # sWBGT = 0.567*T + 0.393*e + 3.94  ->  14.175 + 7.86 + 3.94 = 25.975
+    assert core.simplified_wbgt(25.0, 20.0) == pytest.approx(25.975, rel=1e-5)
