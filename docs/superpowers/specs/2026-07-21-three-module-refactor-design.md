@@ -81,24 +81,30 @@ wherever the same quantity appears:
 
 ### Function list
 
+Function names say what is computed; parameter names carry the units; return
+units are documented per function. Putting the return unit in the function name
+instead would make `vapor_pressure_hpa` both a module-level function and a
+parameter of four other functions, and that shadowing is exactly the kind of
+thing this refactor is meant to remove.
+
 | Function | Returns |
 | --- | --- |
 | `celsius_to_fahrenheit(air_temperature_celsius)` | °F |
 | `fahrenheit_to_celsius(air_temperature_fahrenheit)` | °C |
 | `kelvin_to_celsius(air_temperature_kelvin)` | °C |
-| `saturation_vapor_pressure_hpa(air_temperature_celsius)` | hPa (Tetens, separate branches above and below 0 °C) |
-| `vapor_pressure_hpa(specific_humidity, air_pressure_hpa)` | hPa |
-| `relative_humidity_percent(vapor_pressure_hpa, saturation_vapor_pressure_hpa)` | % |
+| `saturation_vapor_pressure(air_temperature_celsius)` | hPa (Tetens, separate branches above and below 0 °C) |
 | `saturation_vapor_pressure_slope(air_temperature_celsius)` | hPa/°C |
-| `heat_index_fahrenheit(air_temperature_fahrenheit, relative_humidity_percent)` | °F |
-| `apparent_temperature_celsius(air_temperature_celsius, vapor_pressure_hpa, wind_speed_ms)` | °C |
-| `humidex_celsius(air_temperature_celsius, vapor_pressure_hpa)` | °C |
-| `simplified_wbgt_celsius(air_temperature_celsius, vapor_pressure_hpa)` | °C |
-| `wet_bulb_temperature_celsius(air_temperature_celsius, specific_humidity, air_pressure_hpa)` | °C |
+| `vapor_pressure(specific_humidity, air_pressure_hpa)` | hPa |
+| `relative_humidity(vapor_pressure_hpa, saturation_vapor_pressure_hpa)` | % |
+| `heat_index(air_temperature_fahrenheit, relative_humidity_percent)` | °F |
+| `apparent_temperature(air_temperature_celsius, vapor_pressure_hpa, wind_speed_ms)` | °C |
+| `humidex(air_temperature_celsius, vapor_pressure_hpa)` | °C |
+| `simplified_wbgt(air_temperature_celsius, vapor_pressure_hpa)` | °C |
+| `wet_bulb_temperature(air_temperature_celsius, specific_humidity, air_pressure_hpa)` | °C |
 
 ### Deliberate changes from `metrics.py`
 
-1. **`vapor_pressure_hpa` takes ambient pressure.** Today it hardcodes
+1. **`vapor_pressure` takes ambient pressure.** Today it hardcodes
    1013.25 hPa. AORC provides `PRES_surface`, which is already read for wet-bulb,
    so the real value is used. This is a scientific change, not a pure refactor:
    output values for heat index, apparent temperature, humidex, and sWBGT will
@@ -108,7 +114,7 @@ wherever the same quantity appears:
    `ddt_saturation_vapor_pressure(temp, esat)` accepts a pair that a caller
    could make physically inconsistent. Recomputing `esat` internally makes the
    function stand-alone and independently testable, at the cost of one extra
-   `exp()` per Newton iteration inside `wet_bulb_temperature_celsius`.
+   `exp()` per Newton iteration inside `wet_bulb_temperature`.
 
 3. **The `get_aorc_*` composers are removed.** Unit conversion and composition
    from AORC's raw variables move to `pipeline.py`, leaving `core.py` free of
@@ -156,9 +162,9 @@ open_zarr(s3://noaa-nws-aorc-v1-1-1km/{year}.zarr, consolidated=True)
 shared intermediates — computed once, reused by every metric that needs them:
   air_temperature_celsius   = core.kelvin_to_celsius(TMP_2maboveground)
   air_pressure_hpa          = PRES_surface / 100
-  vapor_pressure_hpa        = core.vapor_pressure_hpa(SPFH_2maboveground, air_pressure_hpa)
-  saturation_vapor_pressure = core.saturation_vapor_pressure_hpa(air_temperature_celsius)   [heat index only]
-  relative_humidity_percent = core.relative_humidity_percent(vapor_pressure_hpa, saturation_vapor_pressure)
+  vapor_pressure_hpa        = core.vapor_pressure(SPFH_2maboveground, air_pressure_hpa)
+  saturation_vapor_pressure = core.saturation_vapor_pressure(air_temperature_celsius)       [heat index only]
+  relative_humidity_percent = core.relative_humidity(vapor_pressure_hpa, saturation_vapor_pressure)
                                                                                             [heat index only]
   wind_speed_ms             = sqrt(UGRD_10maboveground² + VGRD_10maboveground²)             [apparent temp only]
 
@@ -242,12 +248,25 @@ doing it up front is what makes a single continuous store possible.
 daily_metrics(aorc_dataset, metric_names) -> xr.Dataset
     Lazy. Returns exactly the requested metrics × {min, mean, max}.
 
-initialize_output_store(store_path, metric_names, time_axis, latitude, longitude)
+initialize_output_store(store_path, metric_names, time_axis, template)
     Creates or extends the store with NaN-filled variables. No computation.
+    `template` is one block of daily_metrics output, supplying the spatial
+    coordinates and chunk sizes.
+
+write_block(store_path, daily, time_axis)
+    Writes a contiguous block of days into its region, locating that region
+    from the block's own timestamps rather than from a year number.
 
 run(output_dir, metric_names, start_year, end_year)
     Orchestrates the skip check, template write, and per-year region writes.
 ```
+
+The output store is chunked at one day per time chunk. Input chunked at 24 hours
+yields daily output chunked at exactly 1, so every region write lands on chunk
+boundaries and no two writes can touch the same chunk — which is what makes the
+region writes safe without `safe_chunks=False`. Variables are allocated with an
+explicit `_FillValue` of NaN, because zarr otherwise defaults float arrays to a
+fill value of 0 and unwritten days would read back as plausible-looking zeroes.
 
 ### Metadata
 
