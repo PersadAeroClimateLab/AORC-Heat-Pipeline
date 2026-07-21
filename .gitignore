@@ -5,6 +5,7 @@ __pycache__/
 *.zarr/
 *.nc
 *.sif
+*.npz
 
 # C extensions
 *.so

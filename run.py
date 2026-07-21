@@ -7,6 +7,7 @@ import s3fs
 import dask
 import metrics
 import romps_heat_index as rhi
+import lut_runtime  # LUT-backed drop-ins for the iterative metrics (wbt, romps HI)
 from datetime import datetime
 from dask.distributed import LocalCluster, Client
 import dask
@@ -163,7 +164,7 @@ if __name__ == "__main__":
 
         print(f"{datetime.now().timestamp()} [compute] Calculating daily wet-bulb temperature metrics for {year}.")
         aorc_wbt = xr.apply_ufunc(
-            metrics.get_aorc_wbt,
+            lut_runtime.get_aorc_wbt,
             aorc_ds["TMP_2maboveground"],
             aorc_ds["SPFH_2maboveground"],
             aorc_ds["PRES_surface"],
@@ -193,7 +194,7 @@ if __name__ == "__main__":
 
         print(f"{datetime.now().timestamp()} [compute] Calculating daily Romps heat-index metrics for {year}.")
         aorc_rhi = xr.apply_ufunc(
-            rhi.get_aorc_romps_heat_index,
+            lut_runtime.get_aorc_romps_heat_index,
             aorc_ds["TMP_2maboveground"],
             aorc_ds["SPFH_2maboveground"],
             dask="parallelized",
