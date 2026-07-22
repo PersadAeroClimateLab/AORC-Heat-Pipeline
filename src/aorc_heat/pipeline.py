@@ -12,8 +12,11 @@ values.
 """
 
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 from typing import Callable
 
+import dask.array
 import numpy as np
 import xarray as xr
 
@@ -254,3 +257,244 @@ def daily_metrics(aorc_dataset, metric_names):
             daily[f"{name}_{statistic}"] = reduced
 
     return xr.Dataset(daily, attrs=GLOBAL_ATTRIBUTES)
+
+
+OUTPUT_STORE_NAME = "aorc_heat_metrics.zarr"
+
+#: Output time chunk, in days. One day per chunk is deliberate: the input is
+#: chunked at 24 hours, so each daily result is already one chunk along time and
+#: every yearly region write lands exactly on chunk boundaries. Any larger value
+#: would leave partial chunks at year boundaries, which two different region
+#: writes could then race on.
+OUTPUT_TIME_CHUNK_DAYS = 1
+
+OUTPUT_DIMENSIONS = ("time", "latitude", "longitude")
+
+
+def _log(message):
+    """Timestamped progress line, matching the previous pipeline's output style."""
+    print(f"{datetime.now().timestamp()} {message}", flush=True)
+
+
+def daily_time_axis(start_year, end_year):
+    """The daily time coordinate the output store spans.
+
+    A single explicit calendar is used for the whole range so that each year's
+    result can be converted to match before it is written.
+
+    :param start_year: First calendar year, inclusive
+    :param end_year: Last calendar year, inclusive
+    :return: CFTimeIndex with one entry per day
+    """
+    if end_year < start_year:
+        raise ValueError(f"end_year {end_year} precedes start_year {start_year}")
+    return xr.date_range(
+        f"{start_year}-01-01",
+        f"{end_year}-12-31",
+        freq="D",
+        use_cftime=True,
+        calendar="standard",
+    )
+
+
+def time_region(time_axis, block_index):
+    """Locate a contiguous block of days within the store's time axis.
+
+    Deriving the region from the block's own timestamps rather than from a year
+    number means a partial year writes correctly, and a block that does not line
+    up with the store is caught here instead of corrupting a region.
+
+    :param time_axis: Full daily time axis from `daily_time_axis`
+    :param block_index: Time index of the block about to be written
+    :return: Slice of positional indices into `time_axis`
+    """
+    start = int(time_axis.get_loc(block_index[0]))
+    stop = start + block_index.size
+    if stop > time_axis.size:
+        raise ValueError(
+            f"Block of {block_index.size} days starting at index {start} runs past "
+            f"the end of the store's {time_axis.size}-day axis."
+        )
+    if not np.array_equal(np.asarray(time_axis[start:stop]), np.asarray(block_index)):
+        raise ValueError(
+            "Block timestamps are not contiguous within the store's time axis."
+        )
+    return slice(start, stop)
+
+
+def pending_metrics(store_path, metric_names, time_axis):
+    """Metrics that still need computing, after validating the existing store.
+
+    A metric counts as present when its `_mean` variable exists. This does not
+    verify that every year was written; see the known limitation in the design
+    spec.
+
+    :param store_path: Path to the output zarr store
+    :param metric_names: Requested metric names
+    :param time_axis: Expected daily time axis
+    :return: The subset of `metric_names` not already in the store
+    """
+    _validate_metric_names(metric_names)
+    store_path = Path(store_path)
+    if not store_path.exists():
+        return list(metric_names)
+
+    existing = xr.open_zarr(store_path, consolidated=True)
+    if existing.sizes.get("time") != time_axis.size:
+        raise ValueError(
+            f"Existing store at {store_path} spans {existing.sizes.get('time')} days, "
+            f"which does not match the {time_axis.size} days requested. "
+            "Delete the store or request the range it already covers."
+        )
+    return [name for name in metric_names if f"{name}_mean" not in existing.data_vars]
+
+
+def initialize_output_store(store_path, metric_names, time_axis, template):
+    """Allocate NaN-filled variables for `metric_names` without computing anything.
+
+    Creates the store when absent, otherwise appends the new variables to it.
+    The template supplies the spatial coordinates and chunk sizes.
+
+    :param store_path: Path to the output zarr store
+    :param metric_names: Metrics to allocate
+    :param time_axis: Full daily time axis
+    :param template: One year of `daily_metrics` output, used for its grid
+    """
+    store_path = Path(store_path)
+    spatial_chunks = tuple(
+        template.chunksizes[dimension][0] for dimension in ("latitude", "longitude")
+    )
+    shape = (time_axis.size, template.sizes["latitude"], template.sizes["longitude"])
+    chunks = (OUTPUT_TIME_CHUNK_DAYS,) + spatial_chunks
+
+    if store_path.exists():
+        existing = xr.open_zarr(store_path, consolidated=True)
+        for dimension in ("latitude", "longitude"):
+            if not np.array_equal(existing[dimension].values, template[dimension].values):
+                raise ValueError(
+                    f"Existing store at {store_path} has a different {dimension} axis "
+                    "than the requested region. Delete the store to rebuild it."
+                )
+
+    placeholder = dask.array.full(shape, np.nan, dtype=np.float32, chunks=chunks)
+    variables = {
+        f"{name}_{statistic}": (
+            OUTPUT_DIMENSIONS,
+            placeholder,
+            _variable_attributes(name, statistic),
+        )
+        for name in metric_names
+        for statistic in DAILY_STATISTICS
+    }
+    allocation = xr.Dataset(
+        variables,
+        coords={
+            "time": time_axis,
+            "latitude": template["latitude"],
+            "longitude": template["longitude"],
+        },
+        attrs=GLOBAL_ATTRIBUTES,
+    )
+    # Without an explicit fill value, zarr defaults to 0.0 for float arrays and
+    # days that were never written would read back as a plausible-looking zero
+    # instead of NaN.
+    encoding = {name: {"_FillValue": np.float32("nan")} for name in variables}
+
+    allocation.to_zarr(
+        store_path,
+        mode="a" if store_path.exists() else "w",
+        compute=False,
+        zarr_format=2,
+        consolidated=True,
+        encoding=encoding,
+    )
+
+
+def write_block(store_path, daily, time_axis):
+    """Write a contiguous block of daily metrics into its region of the store.
+
+    The block is converted to the store's calendar and rechunked to one day per
+    chunk so the write aligns exactly with the store's chunking. Coordinate
+    variables are dropped because they already exist in the store.
+
+    :param store_path: Path to the output zarr store
+    :param daily: A contiguous block of `daily_metrics` output
+    :param time_axis: Full daily time axis
+    """
+    aligned = daily.convert_calendar("standard", use_cftime=True)
+    region = time_region(time_axis, aligned.indexes["time"])
+    aligned = aligned.chunk({"time": OUTPUT_TIME_CHUNK_DAYS})
+    aligned = aligned.drop_vars(list(aligned.coords))
+    aligned.to_zarr(Path(store_path), region={"time": region})
+
+
+def open_aorc_year(year, region, variable_names, filesystem=None):
+    """Open one AORC year, restricted to the requested variables and region.
+
+    :param year: Calendar year to open
+    :param region: A `mask.Region` describing the area of interest
+    :param variable_names: Raw AORC variable names to read
+    :param filesystem: Optional preconfigured s3fs filesystem
+    :return: Cropped, masked, rechunked dataset
+    """
+    if filesystem is None:
+        import s3fs
+
+        filesystem = s3fs.S3FileSystem(anon=True)
+
+    dataset = xr.open_zarr(
+        filesystem.get_mapper(f"{AORC_S3_BASE_PATH}{year}.zarr"), consolidated=True
+    )
+    return prepare_dataset(dataset[list(variable_names)], region)
+
+
+def run(output_dir, metric_names, start_year, end_year, filesystem=None):
+    """Compute the requested metrics across the year range into one zarr store.
+
+    Metrics already present in the store are skipped rather than recomputed, so
+    a store can be extended one metric at a time across several invocations.
+
+    :param output_dir: Directory the zarr store lives in
+    :param metric_names: Metrics from `METRICS` to compute
+    :param start_year: First calendar year, inclusive
+    :param end_year: Last calendar year, inclusive
+    :param filesystem: Optional preconfigured s3fs filesystem
+    :return: Path to the output store
+    """
+    from aorc_heat import mask as mask_module
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+    store_path = output_dir / OUTPUT_STORE_NAME
+    time_axis = daily_time_axis(start_year, end_year)
+
+    pending = pending_metrics(store_path, metric_names, time_axis)
+    if not pending:
+        _log("[init] Every requested metric is already in the store; nothing to compute.")
+        return store_path
+    _log(f"[init] Computing {', '.join(pending)} for {start_year}-{end_year}.")
+
+    if filesystem is None:
+        import s3fs
+
+        filesystem = s3fs.S3FileSystem(anon=True)
+
+    sample = xr.open_zarr(
+        filesystem.get_mapper(f"{AORC_S3_BASE_PATH}{start_year}.zarr"), consolidated=True
+    )
+    _log("[init] Loading the Texas mask.")
+    region = mask_module.texas_region(sample.latitude.values, sample.longitude.values)
+
+    variables = required_variables(pending)
+    first_year = open_aorc_year(start_year, region, variables, filesystem)
+    initialize_output_store(store_path, pending, time_axis, daily_metrics(first_year, pending))
+    _log(f"[init] Allocated {len(pending) * len(DAILY_STATISTICS)} variables in {store_path}.")
+
+    for year in range(start_year, end_year + 1):
+        _log(f"[compute] Deriving metrics for {year}.")
+        dataset = open_aorc_year(year, region, variables, filesystem)
+        write_block(store_path, daily_metrics(dataset, pending), time_axis)
+        _log(f"[compute] Wrote {year}.")
+
+    _log("[final] Finished.")
+    return store_path

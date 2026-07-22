@@ -185,3 +185,136 @@ def test_prepare_dataset_crops_masks_and_chunks(synthetic_aorc_dataset):
     loaded = prepared.compute()
     assert not np.isnan(loaded["TMP_2maboveground"].isel(latitude=0, longitude=0)).any()
     assert bool(np.isnan(loaded["TMP_2maboveground"].isel(latitude=1, longitude=1)).all())
+
+
+# ---------------------------------------------------------------------------
+# Output store
+# ---------------------------------------------------------------------------
+def test_daily_time_axis_spans_whole_years_and_handles_leap_days():
+    axis = pipeline.daily_time_axis(1999, 2000)
+    assert axis.size == 365 + 366
+    assert axis[0].year == 1999 and axis[0].month == 1 and axis[0].day == 1
+    assert axis[-1].year == 2000 and axis[-1].month == 12 and axis[-1].day == 31
+
+
+def test_time_region_locates_a_block_within_the_axis():
+    axis = pipeline.daily_time_axis(1999, 2000)
+    assert pipeline.time_region(axis, axis[:365]) == slice(0, 365)
+    assert pipeline.time_region(axis, axis[365:]) == slice(365, 731)
+    assert pipeline.time_region(axis, axis[10:12]) == slice(10, 12)
+
+
+def test_time_region_rejects_a_block_outside_the_axis():
+    axis = pipeline.daily_time_axis(2000, 2000)
+    outside = pipeline.daily_time_axis(1990, 1990)[:5]
+    with pytest.raises(KeyError):
+        pipeline.time_region(axis, outside)
+
+
+def _template_for(dataset, metric_names):
+    return pipeline.daily_metrics(dataset, metric_names)
+
+
+def test_initialize_output_store_creates_requested_variables(tmp_path, synthetic_aorc_dataset):
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+    template = _template_for(synthetic_aorc_dataset, ["humidex"])
+
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, template)
+
+    written = xr.open_zarr(store_path, consolidated=True)
+    assert sorted(written.data_vars) == ["humidex_max", "humidex_mean", "humidex_min"]
+    assert written.sizes["time"] == 366
+    assert written.chunksizes["time"][0] == 1
+
+
+def test_initialize_output_store_appends_new_metrics(tmp_path, synthetic_aorc_dataset):
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+
+    pipeline.initialize_output_store(
+        store_path, ["humidex"], axis, _template_for(synthetic_aorc_dataset, ["humidex"])
+    )
+    pipeline.initialize_output_store(
+        store_path,
+        ["simplified_wbgt"],
+        axis,
+        _template_for(synthetic_aorc_dataset, ["simplified_wbgt"]),
+    )
+
+    written = xr.open_zarr(store_path, consolidated=True)
+    assert "humidex_mean" in written.data_vars
+    assert "simplified_wbgt_mean" in written.data_vars
+
+
+def test_pending_metrics_skips_what_is_already_present(tmp_path, synthetic_aorc_dataset):
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+
+    assert pipeline.pending_metrics(store_path, ["humidex", "heat_index"], axis) == [
+        "humidex",
+        "heat_index",
+    ]
+
+    pipeline.initialize_output_store(
+        store_path, ["humidex"], axis, _template_for(synthetic_aorc_dataset, ["humidex"])
+    )
+    assert pipeline.pending_metrics(store_path, ["humidex", "heat_index"], axis) == ["heat_index"]
+
+
+def test_pending_metrics_rejects_time_axis_mismatch(tmp_path, synthetic_aorc_dataset):
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    pipeline.initialize_output_store(
+        store_path,
+        ["humidex"],
+        pipeline.daily_time_axis(2000, 2000),
+        _template_for(synthetic_aorc_dataset, ["humidex"]),
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        pipeline.pending_metrics(store_path, ["heat_index"], pipeline.daily_time_axis(1999, 2001))
+
+
+def test_unwritten_days_read_back_as_nan(tmp_path, synthetic_aorc_dataset):
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+    template = _template_for(synthetic_aorc_dataset, ["humidex"])
+
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, template)
+
+    written = xr.open_zarr(store_path, consolidated=True)
+    # Nothing has been written yet, so every day must read as NaN rather than 0.
+    assert bool(np.isnan(written["humidex_mean"].isel(time=0)).all())
+
+
+def test_write_block_fills_only_its_own_days(tmp_path, synthetic_aorc_dataset):
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+    daily = _template_for(synthetic_aorc_dataset, ["humidex"])
+
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, daily)
+    pipeline.write_block(store_path, daily, axis)
+
+    written = xr.open_zarr(store_path, consolidated=True).compute()
+    # The synthetic dataset covers 1-2 July 2000: days 182 and 183 of a leap year.
+    assert not bool(np.isnan(written["humidex_mean"].isel(time=slice(182, 184))).any())
+    assert bool(np.isnan(written["humidex_mean"].isel(time=0)).all())
+    assert bool(np.isnan(written["humidex_mean"].isel(time=365)).all())
+
+
+def test_adding_a_metric_leaves_earlier_values_untouched(tmp_path, synthetic_aorc_dataset):
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+
+    first = _template_for(synthetic_aorc_dataset, ["humidex"])
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, first)
+    pipeline.write_block(store_path, first, axis)
+    before = xr.open_zarr(store_path, consolidated=True)["humidex_mean"].compute()
+
+    second = _template_for(synthetic_aorc_dataset, ["simplified_wbgt"])
+    pipeline.initialize_output_store(store_path, ["simplified_wbgt"], axis, second)
+    pipeline.write_block(store_path, second, axis)
+
+    after = xr.open_zarr(store_path, consolidated=True)
+    np.testing.assert_array_equal(before.values, after["humidex_mean"].compute().values)
+    assert "simplified_wbgt_mean" in after.data_vars
