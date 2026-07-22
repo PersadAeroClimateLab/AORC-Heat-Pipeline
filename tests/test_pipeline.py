@@ -187,55 +187,107 @@ def test_prepare_dataset_crops_masks_and_chunks(synthetic_aorc_dataset):
     assert bool(np.isnan(loaded["TMP_2maboveground"].isel(latitude=1, longitude=1)).all())
 
 
-def test_prepare_dataset_imposes_its_own_spatial_chunking(synthetic_aorc_dataset):
-    """`prepare_dataset` must not inherit the source store's spatial chunking.
+def test_prepare_dataset_preserves_native_spatial_chunking(synthetic_aorc_dataset):
+    """`prepare_dataset` rechunks time only, leaving spatial chunks untouched.
 
-    The 2x2 synthetic grid is far smaller than `SPATIAL_CHUNK_SIZE`, so dask
-    collapses it to a single spatial chunk either way; this only checks that
-    the dimension is chunked at all (rather than left as one native chunk
-    that happens to also be size 2). The real, size-dependent behaviour is
-    covered by `test_write_block_succeeds_when_the_crop_does_not_start_on_a_chunk_boundary`.
+    Alignment is the region's responsibility now, not this function's: the
+    crop is snapped to native chunk boundaries before it ever gets here, so
+    rechunking space would be a pointless shuffle. Verified on a grid chunked
+    into two spatial chunks, which would collapse to one if the function
+    imposed its own chunking.
     """
     from aorc_heat.mask import Region
 
+    source = synthetic_aorc_dataset.chunk(
+        {"time": 24, "latitude": 1, "longitude": 1}
+    )
     mask = xr.DataArray(
         np.ones((2, 2), dtype=bool),
         dims=("latitude", "longitude"),
         coords={
-            "latitude": synthetic_aorc_dataset.latitude,
-            "longitude": synthetic_aorc_dataset.longitude,
+            "latitude": source.latitude,
+            "longitude": source.longitude,
         },
     )
     region = Region(mask=mask, latitude_slice=slice(0, 2), longitude_slice=slice(0, 2))
 
-    prepared = pipeline.prepare_dataset(synthetic_aorc_dataset, region)
+    prepared = pipeline.prepare_dataset(source, region)
 
-    assert prepared.chunksizes["latitude"] == (2,)
-    assert prepared.chunksizes["longitude"] == (2,)
+    assert prepared.chunksizes["time"] == (24, 24)
+    assert prepared.chunksizes["latitude"] == (1, 1)
+    assert prepared.chunksizes["longitude"] == (1, 1)
 
 
-def test_write_block_succeeds_when_the_crop_does_not_start_on_a_chunk_boundary(tmp_path):
-    """A region write must succeed when the crop starts mid native-chunk.
-
-    Mirrors the real Texas bounding box crop, whose start indices (701, 2803
-    into the AORC domain) are prime and so never land on a native chunk
-    boundary no matter what chunk size the source store used. Before the fix,
-    `prepare_dataset` inherited that native spatial chunking, so
-    `initialize_output_store` derived a declared zarr chunk size from a
-    partial first dask chunk, and `write_block` handed xarray dask chunks that
-    didn't match it -- raising a "would overlap multiple Dask chunks" error on
-    the very first write. This builds a synthetic "source store" natively
-    chunked at sizes that don't divide the crop's start index, to reproduce
-    that misalignment, and asserts the write completes instead.
-    """
+def test_prepare_dataset_casts_to_float32(synthetic_aorc_dataset):
+    """Raw AORC variables are float64 on disk; everything downstream is float32."""
     from aorc_heat.mask import Region
 
+    source = synthetic_aorc_dataset.astype(np.float64)
+    assert source["TMP_2maboveground"].dtype == np.float64
+
+    mask = xr.DataArray(
+        np.ones((2, 2), dtype=bool),
+        dims=("latitude", "longitude"),
+        coords={"latitude": source.latitude, "longitude": source.longitude},
+    )
+    region = Region(mask=mask, latitude_slice=slice(0, 2), longitude_slice=slice(0, 2))
+
+    prepared = pipeline.prepare_dataset(source, region)
+
+    for name, variable in prepared.data_vars.items():
+        assert variable.dtype == np.float32, name
+
+
+def test_native_spatial_chunks_reads_the_zarr_encoding(tmp_path):
+    """Alignment must come from the on-disk chunk grid, not from dask.
+
+    xarray may coalesce several stored chunks into one dask chunk when opening,
+    so reading `.chunks` would give a different -- and wrong -- answer.
+    """
+    store_path = tmp_path / "source.zarr"
+    dataset = xr.Dataset(
+        {
+            "TMP_2maboveground": (
+                ("time", "latitude", "longitude"),
+                np.zeros((4, 16, 24), dtype=np.float32),
+            )
+        },
+        coords={
+            "time": xr.date_range("2000-01-01", periods=4, freq="h", use_cftime=True),
+            "latitude": np.arange(16.0),
+            "longitude": np.arange(24.0),
+        },
+    )
+    dataset.chunk({"time": 4, "latitude": 8, "longitude": 12}).to_zarr(
+        store_path, zarr_format=2, consolidated=True
+    )
+
+    reopened = xr.open_zarr(store_path, consolidated=True)
+    assert pipeline.native_spatial_chunks(reopened) == (8, 12)
+
+
+def test_write_block_succeeds_when_the_raw_bbox_starts_mid_chunk(tmp_path):
+    """A region write must succeed when the mask's own bbox starts mid-chunk.
+
+    Mirrors the real Texas bounding box, whose start indices into the AORC
+    domain (701, 2803) are prime and so land mid-chunk for any realistic
+    native chunk size. Taken raw, that produces a partial *first* dask chunk;
+    `initialize_output_store` would then declare the zarr chunk size from that
+    partial remainder and `write_block` would raise "would overlap multiple
+    Dask chunks" on the very first write.
+
+    The guarantee now lives in `crop_to_bounding_box`, which snaps the box
+    outward to native boundaries. This test goes through that real path --
+    building a mask whose true extent starts at a prime offset, then cropping
+    it with alignment -- rather than hand-constructing an already-aligned
+    Region, so it exercises the actual production sequence.
+    """
+    from aorc_heat.mask import crop_to_bounding_box
+
     domain_size = 320
-    crop_length = 290  # bigger than SPATIAL_CHUNK_SIZE, so the crop spans a
-    # full 256 chunk plus a smaller final one -- proving a partial *last*
-    # chunk is fine while a partial *first* chunk (what this test guards
-    # against) is not.
-    latitude_start, longitude_start = 5, 11  # neither divides the native chunk sizes below
+    native_chunks = (41, 43)  # both prime, so nothing divides the offsets below
+    extent = 190
+    latitude_start, longitude_start = 701 % domain_size, 2803 % domain_size
 
     full_latitudes = np.arange(domain_size, dtype=np.float64)
     full_longitudes = np.arange(domain_size, dtype=np.float64)
@@ -245,7 +297,7 @@ def test_write_block_succeeds_when_the_crop_does_not_start_on_a_chunk_boundary(t
     generator = np.random.default_rng(seed=99)
 
     def field(low, high):
-        return generator.uniform(low, high, size=shape).astype(np.float32)
+        return generator.uniform(low, high, size=shape).astype(np.float64)
 
     full_domain = xr.Dataset(
         {
@@ -254,19 +306,25 @@ def test_write_block_succeeds_when_the_crop_does_not_start_on_a_chunk_boundary(t
             "PRES_surface": (("time", "latitude", "longitude"), field(98000.0, 101500.0)),
         },
         coords={"time": times, "latitude": full_latitudes, "longitude": full_longitudes},
-    ).chunk({"time": 24, "latitude": 41, "longitude": 43})  # native chunk sizes, both prime
+    ).chunk({"time": 24, "latitude": native_chunks[0], "longitude": native_chunks[1]})
 
-    latitude_slice = slice(latitude_start, latitude_start + crop_length)
-    longitude_slice = slice(longitude_start, longitude_start + crop_length)
-    mask = xr.DataArray(
-        np.ones((crop_length, crop_length), dtype=bool),
+    selected = np.zeros((domain_size, domain_size), dtype=bool)
+    selected[
+        latitude_start : latitude_start + extent,
+        longitude_start : longitude_start + extent,
+    ] = True
+    full_mask = xr.DataArray(
+        selected,
         dims=("latitude", "longitude"),
-        coords={
-            "latitude": full_domain.latitude.isel(latitude=latitude_slice),
-            "longitude": full_domain.longitude.isel(longitude=longitude_slice),
-        },
+        coords={"latitude": full_latitudes, "longitude": full_longitudes},
     )
-    region = Region(mask=mask, latitude_slice=latitude_slice, longitude_slice=longitude_slice)
+
+    # The raw bbox starts mid-chunk; snapping must pull it back to a boundary.
+    assert latitude_start % native_chunks[0] != 0
+    assert longitude_start % native_chunks[1] != 0
+    region = crop_to_bounding_box(full_mask, alignment=native_chunks)
+    assert region.latitude_slice.start % native_chunks[0] == 0
+    assert region.longitude_slice.start % native_chunks[1] == 0
 
     prepared = pipeline.prepare_dataset(full_domain, region)
     daily = pipeline.daily_metrics(prepared, ["humidex"])
@@ -280,7 +338,16 @@ def test_write_block_succeeds_when_the_crop_does_not_start_on_a_chunk_boundary(t
 
     written = xr.open_zarr(store_path, consolidated=True).compute()
     # The synthetic data covers 1-2 July 2000: days 182 and 183 of a leap year.
-    assert not bool(np.isnan(written["humidex_mean"].isel(time=slice(182, 184))).any())
+    written_days = written["humidex_mean"].isel(time=slice(182, 184)).values
+    inside = region.mask.values
+
+    # Every cell the mask selects carries real data...
+    assert not bool(np.isnan(written_days[:, inside]).any())
+    # ...and every cell the snap widened into stays NaN, so the margin is
+    # inert rather than silently contributing values outside the boundary.
+    assert bool(np.isnan(written_days[:, ~inside]).all())
+    assert (~inside).any(), "snapping should have widened past the mask"
+
     assert bool(np.isnan(written["humidex_mean"].isel(time=0)).all())
 
 

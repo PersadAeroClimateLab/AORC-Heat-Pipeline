@@ -125,10 +125,34 @@ def build_mask(latitudes, longitudes, shapefile_path):
     return mask_from_polygon(latitudes, longitudes, polygon)
 
 
-def crop_to_bounding_box(mask):
+def _snap_outward(start, stop, alignment, limit):
+    """Widen [start, stop) so it begins on a multiple of `alignment`.
+
+    :param start: First selected index
+    :param stop: One past the last selected index
+    :param alignment: Chunk size to align the start to
+    :param limit: Size of the axis, so the end never runs past the domain
+    :return: (start, stop) widened to chunk boundaries
+    """
+    widened_start = (start // alignment) * alignment
+    widened_stop = min(-(-stop // alignment) * alignment, limit)
+    return widened_start, widened_stop
+
+
+def crop_to_bounding_box(mask, alignment=None):
     """Crop a mask to the bounding box of its selected cells.
 
+    With `alignment`, the box is widened outward so it *starts* on a multiple of
+    the given chunk sizes. That matters because zarr chunks are atomic: reading
+    a box whose start falls mid-chunk still downloads the whole chunk, so the
+    extra cells are already being paid for. Aligning the start means the cropped
+    array's first chunk is a full one, which in turn keeps every later chunk
+    boundary lined up with the store's -- the condition zarr region writes
+    require. A partial chunk at the far end is harmless; only a partial first
+    chunk desynchronises everything after it.
+
     :param mask: Boolean DataArray over dims ("latitude", "longitude")
+    :param alignment: Optional (latitude, longitude) chunk sizes to align to
     :return: A Region holding the cropped mask and the slices that produced it
     """
     latitude_indices = np.flatnonzero(mask.any("longitude").values)
@@ -136,8 +160,20 @@ def crop_to_bounding_box(mask):
     if latitude_indices.size == 0 or longitude_indices.size == 0:
         raise ValueError("Cannot crop a mask with no selected cells.")
 
-    latitude_slice = slice(int(latitude_indices[0]), int(latitude_indices[-1]) + 1)
-    longitude_slice = slice(int(longitude_indices[0]), int(longitude_indices[-1]) + 1)
+    latitude_start, latitude_stop = int(latitude_indices[0]), int(latitude_indices[-1]) + 1
+    longitude_start, longitude_stop = int(longitude_indices[0]), int(longitude_indices[-1]) + 1
+
+    if alignment is not None:
+        latitude_alignment, longitude_alignment = alignment
+        latitude_start, latitude_stop = _snap_outward(
+            latitude_start, latitude_stop, latitude_alignment, mask.sizes["latitude"]
+        )
+        longitude_start, longitude_stop = _snap_outward(
+            longitude_start, longitude_stop, longitude_alignment, mask.sizes["longitude"]
+        )
+
+    latitude_slice = slice(latitude_start, latitude_stop)
+    longitude_slice = slice(longitude_start, longitude_stop)
     return Region(
         mask=mask.isel(latitude=latitude_slice, longitude=longitude_slice),
         latitude_slice=latitude_slice,
@@ -150,6 +186,7 @@ def texas_region(
     longitudes,
     mask_path=TEXAS_MASK_PATH,
     shapefile_path=TEXAS_SHAPEFILE_PATH,
+    alignment=None,
 ):
     """Load the Texas mask, generating and caching it from the shapefile if absent.
 
@@ -157,6 +194,8 @@ def texas_region(
     :param longitudes: 1-D array of AORC longitudes in degrees east
     :param mask_path: Where the generated mask is cached
     :param shapefile_path: Source shapefile used when the cache is missing
+    :param alignment: Optional (latitude, longitude) chunk sizes to align the
+        bounding box start to; see `crop_to_bounding_box`
     :return: A Region cropped to the Texas bounding box
     """
     mask_path = Path(mask_path)
@@ -174,4 +213,4 @@ def texas_region(
         mask_path.parent.mkdir(parents=True, exist_ok=True)
         mask.to_dataset(name="mask").to_netcdf(mask_path)
 
-    return crop_to_bounding_box(mask)
+    return crop_to_bounding_box(mask, alignment=alignment)

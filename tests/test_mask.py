@@ -105,3 +105,65 @@ def test_crop_to_bounding_box_rejects_empty_mask():
     )
     with pytest.raises(ValueError, match="no selected cells"):
         mask_module.crop_to_bounding_box(empty)
+
+
+def test_crop_to_bounding_box_snaps_outward_to_chunk_boundaries():
+    """With alignment, the box must start on a chunk boundary and still contain
+    every selected cell. Zarr chunks are atomic, so the widened cells are
+    already being downloaded either way -- snapping keeps them instead of
+    discarding them, and makes the first chunk a full one."""
+    latitudes = np.arange(100.0)
+    longitudes = np.arange(200.0)
+    values = np.zeros((100, 200), dtype=bool)
+    values[37:61, 83:129] = True  # starts mid-chunk on both axes
+    full_mask = xr.DataArray(
+        values,
+        dims=("latitude", "longitude"),
+        coords={"latitude": latitudes, "longitude": longitudes},
+    )
+
+    region = mask_module.crop_to_bounding_box(full_mask, alignment=(16, 32))
+
+    assert region.latitude_slice == slice(32, 64)
+    assert region.longitude_slice == slice(64, 160)
+    assert region.latitude_slice.start % 16 == 0
+    assert region.longitude_slice.start % 32 == 0
+    # Widened, never narrowed: every originally-selected cell survives.
+    assert int(region.mask.sum()) == int(full_mask.sum())
+
+
+def test_crop_to_bounding_box_snapping_never_runs_past_the_domain():
+    """The far edge clamps to the axis length, leaving a partial last chunk --
+    which is harmless, unlike a partial first chunk."""
+    latitudes = np.arange(50.0)
+    longitudes = np.arange(50.0)
+    values = np.zeros((50, 50), dtype=bool)
+    values[40:50, 40:50] = True
+    full_mask = xr.DataArray(
+        values,
+        dims=("latitude", "longitude"),
+        coords={"latitude": latitudes, "longitude": longitudes},
+    )
+
+    region = mask_module.crop_to_bounding_box(full_mask, alignment=(16, 16))
+
+    assert region.latitude_slice == slice(32, 50)
+    assert region.longitude_slice == slice(32, 50)
+
+
+def test_crop_to_bounding_box_without_alignment_is_unchanged():
+    """Omitting alignment must keep the exact tight bounding box."""
+    latitudes = np.arange(20.0)
+    longitudes = np.arange(20.0)
+    values = np.zeros((20, 20), dtype=bool)
+    values[3:6, 4:8] = True
+    full_mask = xr.DataArray(
+        values,
+        dims=("latitude", "longitude"),
+        coords={"latitude": latitudes, "longitude": longitudes},
+    )
+
+    region = mask_module.crop_to_bounding_box(full_mask)
+
+    assert region.latitude_slice == slice(3, 6)
+    assert region.longitude_slice == slice(4, 8)

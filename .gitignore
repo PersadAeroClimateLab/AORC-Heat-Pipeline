@@ -6,6 +6,7 @@ __pycache__/
 *.nc
 *.sif
 *.npz
+**output_zarrs/**
 
 # C extensions
 *.so

@@ -7,14 +7,21 @@ metrics that depend on vapour pressure resolve to a single node in the dask
 graph rather than four.
 
 Input is rechunked to 24 hours per chunk so each daily reduction group lives
-entirely inside one chunk. Spatial chunking is NOT left at the source store's
-native values: the pipeline imposes its own `SPATIAL_CHUNK_SIZE` chunking on
-the cropped region instead. The AORC store's native spatial chunk boundaries
-have nothing to do with where a region crop starts, so trusting them produces
-partial chunks at the front of the cropped array -- which then fail zarr's
-chunk-alignment check on the very first region write. Chunking the crop
-ourselves, from position zero, guarantees every chunk but the last is exactly
-`SPATIAL_CHUNK_SIZE` on a side.
+entirely inside one chunk. AORC's native time chunk is 144 hours -- exactly six
+days -- so this is a clean subdivision that keeps chunk boundaries day-aligned.
+
+Spatial chunking is left at the source store's native values, and the region
+crop is snapped outward to start on a native chunk boundary (see
+`mask.crop_to_bounding_box`). Zarr chunks are atomic, so a crop starting
+mid-chunk downloads the whole chunk anyway; snapping keeps the cells already
+paid for instead of discarding them, and it makes every chunk boundary in the
+cropped array line up with the output store's -- the condition zarr region
+writes require. Imposing our own spatial chunking instead would mean a rechunk
+on every read for no benefit.
+
+Raw AORC variables are float64 on disk. They are cast to float32 immediately
+after cropping: the science kernels compute in float32 regardless, and the
+memory-bound closed-form metrics run ~1.5x faster on float32 operands.
 """
 
 from dataclasses import dataclass
@@ -41,14 +48,6 @@ NORTHWARD_WIND = "VGRD_10maboveground"
 HOURS_PER_DAY = 24
 DAILY_STATISTICS = ("min", "mean", "max")
 PASCALS_PER_HECTOPASCAL = np.float32(100.0)
-
-#: The one authoritative spatial chunk size for both the intermediate dask
-#: graph and the output zarr store. Deliberately independent of the source
-#: AORC store's native chunking -- see the module docstring for why. A final
-#: partial chunk at the far edge of a region is fine and writes correctly;
-#: only a partial *first* chunk breaks zarr's chunk-alignment check, and
-#: chunking the crop from position zero avoids that.
-SPATIAL_CHUNK_SIZE = 256
 
 GLOBAL_ATTRIBUTES = {
     "description": "Heat metrics derived from NOAA NWS AORC data provided via AWS S3 Zarr Bucket",
@@ -235,30 +234,49 @@ def required_variables(metric_names):
     return sorted(required)
 
 
+def native_spatial_chunks(dataset):
+    """The source store's (latitude, longitude) chunk sizes.
+
+    Read from the zarr encoding rather than from dask, because xarray may
+    coalesce several stored chunks into one dask chunk when opening. It is the
+    on-disk chunk grid that a region crop has to align to, since zarr chunks
+    are atomic: a read starting mid-chunk still fetches the whole chunk.
+
+    :param dataset: An opened AORC dataset
+    :return: (latitude_chunk, longitude_chunk) in cells
+    """
+    for name in (AIR_TEMPERATURE, SPECIFIC_HUMIDITY, SURFACE_PRESSURE):
+        if name not in dataset.variables:
+            continue
+        chunks = dataset[name].encoding.get("chunks")
+        if chunks and len(chunks) == 3:
+            return int(chunks[1]), int(chunks[2])
+    raise ValueError(
+        "Could not determine the source store's native spatial chunking from "
+        "its zarr encoding; cannot align the region crop to chunk boundaries."
+    )
+
+
 def prepare_dataset(dataset, region):
-    """Crop to the region bounding box, mask, and rechunk time and space.
+    """Crop to the region bounding box, cast to float32, mask, and rechunk time.
 
     Chunking time in 24-hour blocks puts each daily resample group entirely
     inside one chunk, so the reduction never crosses a chunk boundary. Spatial
-    chunking is imposed at `SPATIAL_CHUNK_SIZE` on the *cropped* array rather
-    than inherited from the source store: the crop's own start position, not
-    the source store's native chunk boundaries, is what has to line up with
-    chunk zero, and chunking from position zero here guarantees that.
+    chunking is deliberately left alone: `region`'s slices are already snapped
+    to native chunk boundaries, so the cropped array's chunks line up with both
+    the source store and the output store without any rechunk.
+
+    The cast to float32 happens before masking so that every downstream
+    intermediate is float32 too, not just the kernel outputs.
 
     :param dataset: Full-domain AORC dataset
-    :param region: A `mask.Region` describing the area of interest
-    :return: Cropped, masked, rechunked dataset
+    :param region: A `mask.Region` whose slices are snapped to chunk boundaries
+    :return: Cropped, masked, time-rechunked float32 dataset
     """
     cropped = dataset.isel(
         latitude=region.latitude_slice, longitude=region.longitude_slice
-    )
-    return cropped.where(region.mask).chunk(
-        {
-            "time": HOURS_PER_DAY,
-            "latitude": SPATIAL_CHUNK_SIZE,
-            "longitude": SPATIAL_CHUNK_SIZE,
-        }
-    )
+    ).astype(np.float32)
+    return cropped.where(region.mask).chunk({"time": HOURS_PER_DAY})
 
 
 def daily_metrics(aorc_dataset, metric_names):
@@ -507,9 +525,11 @@ def initialize_output_store(store_path, metric_names, time_axis, template):
     :param template: One year of `daily_metrics` output, used for its grid
     """
     store_path = Path(store_path)
+    # Taken from the template's own first chunk. That is only safe because the
+    # region's slices are snapped to native chunk boundaries, so the first
+    # chunk is a full one rather than a partial leading remainder.
     spatial_chunks = tuple(
-        min(SPATIAL_CHUNK_SIZE, template.sizes[dimension])
-        for dimension in ("latitude", "longitude")
+        template.chunksizes[dimension][0] for dimension in ("latitude", "longitude")
     )
     shape = (time_axis.size, template.sizes["latitude"], template.sizes["longitude"])
     chunks = (OUTPUT_TIME_CHUNK_DAYS,) + spatial_chunks
@@ -564,12 +584,11 @@ def write_block(store_path, daily, time_axis):
     """Write a contiguous block of daily metrics into its region of the store.
 
     The block is converted to the store's calendar and rechunked to one day per
-    chunk in time and `SPATIAL_CHUNK_SIZE` in space so the write aligns exactly
-    with the store's chunking. This rechunk is not a no-op safety net: it is
-    trusted to *make* the block's chunks match the store rather than to merely
-    confirm they already do, since the incoming block's chunking depends on
-    upstream operations this function does not control. Coordinate variables
-    are dropped because they already exist in the store.
+    chunk in time. Spatial chunks are left untouched: they came from the source
+    store via a chunk-boundary-snapped crop, and the output store was allocated
+    with those same sizes, so they already align. Rechunking them here would be
+    a no-op that costs a graph layer. Coordinate variables are dropped because
+    they already exist in the store.
 
     :param store_path: Path to the output zarr store
     :param daily: A contiguous block of `daily_metrics` output
@@ -577,11 +596,7 @@ def write_block(store_path, daily, time_axis):
     """
     aligned = daily.convert_calendar("standard", use_cftime=True)
     region = time_region(time_axis, aligned.indexes["time"])
-    spatial_chunks = {
-        dimension: min(SPATIAL_CHUNK_SIZE, aligned.sizes[dimension])
-        for dimension in ("latitude", "longitude")
-    }
-    aligned = aligned.chunk({"time": OUTPUT_TIME_CHUNK_DAYS, **spatial_chunks})
+    aligned = aligned.chunk({"time": OUTPUT_TIME_CHUNK_DAYS})
     aligned = aligned.drop_vars(list(aligned.coords))
     aligned.to_zarr(Path(store_path), region={"time": region})
 
@@ -641,7 +656,15 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
         filesystem.get_mapper(f"{AORC_S3_BASE_PATH}{start_year}.zarr"), consolidated=True
     )
     _log("[init] Loading the Texas mask.")
-    region = mask_module.texas_region(sample.latitude.values, sample.longitude.values)
+    alignment = native_spatial_chunks(sample)
+    region = mask_module.texas_region(
+        sample.latitude.values, sample.longitude.values, alignment=alignment
+    )
+    _log(
+        f"[init] Native spatial chunks {alignment}; region cropped to "
+        f"latitude[{region.latitude_slice.start}:{region.latitude_slice.stop}] "
+        f"longitude[{region.longitude_slice.start}:{region.longitude_slice.stop}]."
+    )
 
     variables = required_variables(pending)
     first_year = open_aorc_year(start_year, region, variables, filesystem)

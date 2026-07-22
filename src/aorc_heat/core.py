@@ -301,6 +301,23 @@ def wet_bulb_temperature(
     humidity = np.float32(specific_humidity)
     pressure = np.float32(air_pressure_hpa)
 
+    # A NaN input can never converge: every Newton step is NaN, so neither the
+    # tolerance test nor the stall test can ever fire and the loop runs its full
+    # iteration cap. Measured, that makes a NaN cell ~14x more expensive than a
+    # real one -- and since the pipeline masks to a region with `.where`, most
+    # cells in the bounding box are NaN. Returning NaN up front is both the
+    # correct answer and far cheaper.
+    #
+    # This check is only reliable because WET_BULB_FASTMATH_FLAGS omits `nnan`.
+    # Under `fastmath=True` LLVM assumes no operand is ever NaN and is free to
+    # fold the comparison away.
+    if (
+        temperature != temperature
+        or humidity != humidity
+        or pressure != pressure
+    ):
+        return np.float32(np.nan)
+
     epsilon = DRY_AIR_TO_VAPOR_MOLAR_MASS_RATIO
     one_minus_epsilon = np.float32(1.0) - epsilon
     specific_heat_moist_air = SPECIFIC_HEAT_DRY_AIR + (
