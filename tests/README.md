@@ -1,21 +1,24 @@
 # Tests
 
-Unit tests for the heat-stress metrics in [`metrics.py`](../metrics.py).
+Unit tests for the heat-stress formulations in
+[`src/aorc_heat/core.py`](../src/aorc_heat/core.py), the region masking in
+[`src/aorc_heat/mask.py`](../src/aorc_heat/mask.py), the dataset orchestration in
+[`src/aorc_heat/pipeline.py`](../src/aorc_heat/pipeline.py), and argument parsing
+in [`src/aorc_heat/cli.py`](../src/aorc_heat/cli.py).
 
-Expected values are taken from published references (NWS heat-index chart and
-Rothfusz regression, standard Tetens saturation-vapour-pressure tables, the
-Steadman apparent-temperature / Canadian humidex / ACSM simplified-WBGT
-definitions, and Stull's 2011 wet-bulb reference) so that a formula transcription
-error is caught rather than masked.
+Expected values in `test_core.py` are taken from published references — the NWS
+heat-index chart and Rothfusz regression, standard Tetens saturation-vapour-
+pressure tables, the Steadman apparent-temperature, Canadian humidex and ACSM
+simplified-WBGT definitions, and Stull's 2011 wet-bulb reference — so that a
+formula transcription error is caught rather than reproduced. Tolerances are
+loose enough to absorb float32 rounding, which the kernels use by design.
+
+`test_pipeline.py` runs against an in-memory synthetic dataset and a `tmp_path`
+zarr store. Nothing in the suite touches S3 or the network.
 
 ## Running
 
-`pytest` is not part of the runtime image, so install it on top of the project
-deps. From the project root:
-
 ```bash
-docker run --rm -v "$PWD":/project -w /project aorc \
-    bash -c "pip install -q pytest && python -m pytest tests/ -v"
+docker build -t aorc .
+docker run --rm -v "$PWD":/project -w /project aorc python -m pytest tests/ -v
 ```
-
-(Or `pip install -r requirements-dev.txt` once in a persistent environment.)
