@@ -110,13 +110,23 @@ thing this refactor is meant to remove.
    output values for heat index, apparent temperature, humidex, and sWBGT will
    differ from previous runs, most noticeably at elevation in west Texas.
 
-2. **`saturation_vapor_pressure_slope` takes only temperature.** Today's
+2. **`wet_bulb_temperature` returns NaN immediately for NaN input.** Added after
+   measurement, not in the original design. A NaN iterate can never converge —
+   every Newton step is NaN, so neither the tolerance test nor the stall test
+   fires — so masked cells ran the full 50-iteration cap at roughly 14× the cost
+   of a real cell. With about half the bounding box masked, 96% of wet-bulb
+   runtime was being spent on cells that are then discarded. The guard is only
+   sound because the fastmath flag set omits `nnan`; under `fastmath=True` LLVM
+   assumes no NaN operands and folds the comparison away — the same failure mode
+   that originally corrupted NaN propagation here.
+
+3. **`saturation_vapor_pressure_slope` takes only temperature.** Today's
    `ddt_saturation_vapor_pressure(temp, esat)` accepts a pair that a caller
    could make physically inconsistent. Recomputing `esat` internally makes the
    function stand-alone and independently testable, at the cost of one extra
    `exp()` per Newton iteration inside `wet_bulb_temperature`.
 
-3. **The `get_aorc_*` composers are removed.** Unit conversion and composition
+4. **The `get_aorc_*` composers are removed.** Unit conversion and composition
    from AORC's raw variables move to `pipeline.py`, leaving `core.py` free of
    dataset-specific knowledge.
 
@@ -155,7 +165,8 @@ derives its `--metrics` choices from this same mapping.
 
 ```
 open_zarr(s3://noaa-nws-aorc-v1-1-1km/{year}.zarr, consolidated=True)
-  → isel to the Texas mask bounding box
+  → isel to the Texas bounding box, snapped outward to native chunk boundaries
+  → .astype(float32)
   → .where(mask_bbox)
   → .chunk({"time": 24})          spatial chunking left at the store's native values
 
@@ -178,7 +189,44 @@ across every metric that needs it; dask's blockwise fusion keeps the shared
 intermediates from being materialized more than once.
 
 The 24-hour time chunking means each daily resample group falls entirely within
-one chunk, so the reduction is chunk-local.
+one chunk, so the reduction is chunk-local. AORC's native time chunk is 144
+hours — exactly six days — so this is a clean subdivision that keeps chunk
+boundaries day-aligned.
+
+### Chunk alignment (revised after implementation)
+
+The original decision to leave spatial chunking native was correct in intent but
+incomplete, and broke the pipeline in practice. `initialize_output_store` derives
+the output store's chunk size from the cropped array's *first* chunk, and the
+Texas bounding box starts at latitude index 701 and longitude 2803 — both prime,
+so they never land on a native boundary. The first chunk was therefore a partial
+remainder, every later chunk overlapped two store chunks, and the very first
+region write failed zarr's alignment check after a full year of compute.
+
+The fix is to snap the crop outward to native chunk boundaries
+(`mask.crop_to_bounding_box(mask, alignment=...)`). This is free rather than
+merely cheap: zarr chunks are atomic, so a crop starting mid-chunk already
+downloads the whole chunk. Snapping keeps cells that were being transferred and
+discarded. It widens the region 42.9% but costs about 1.6% more time, because
+every added cell lies outside the boundary and is masked to NaN — and NaN cells
+are nearly free (see below).
+
+With the crop aligned, no spatial rechunk is needed anywhere: source, dask
+graph, and output store all share one chunk grid.
+
+### Precision
+
+Raw AORC variables are float64 on disk and are cast to float32 immediately after
+cropping. The kernels compute in float32 regardless; casting early means the
+intermediates are narrow too. Measured, the memory-bound closed-form metrics run
+about 1.5× faster on float32 operands, while `wet_bulb_temperature` — which is
+compute-bound on `exp()` — is indifferent.
+
+One hazard worth recording: because the kernels use bare `@nb.vectorize` with no
+signature list, loops compile lazily and registration order is sticky. If a
+float64 call registers first, later float32 calls find no matching loop, get
+upcast to float64, and run *slower* than passing float64 would have. Cast
+wholesale or not at all.
 
 ### Output store
 
@@ -227,12 +275,22 @@ Re-running a year that was previously written simply overwrites that region.
 There is no per-year resume state; the granularity of "skip work already done"
 is the metric, not the year.
 
-Known limitation: the skip check in step 3 tests only for the presence of a
-variable, not for whether every year's region was successfully written. A run
-interrupted partway through leaves its metric variables allocated but partly
-NaN, and a subsequent run will skip them as "already present". Recovery is to
-delete the affected variables from the store, or the store itself, and re-run.
-Adding automatic detection of incompletely written variables is deferred.
+Revised after implementation: the original skip check tested only whether a
+variable existed. Because `initialize_output_store` allocates variables before
+any year is computed, a crash at any point after allocation — including before
+the first write — left a store that looked finished but held 100% NaN, and a
+rerun printed "nothing to compute" and exited 0. Silent, and near-certain on a
+46-year S3 job.
+
+Completion is now recorded explicitly: `record_completed_years` writes each
+successfully written year into a `completed_years` zarr attribute after
+`write_block` returns, and `pending_metrics` reports a metric done only when the
+recorded years cover the whole requested range. The record is written after the
+write succeeds, so a crash mid-write leaves the year unrecorded.
+
+Remaining limitation, accepted: recovery is at metric granularity, not year. A
+partially complete metric is recomputed from its first year rather than resumed.
+Redundant work, but far better than silently reporting success on empty data.
 
 ### Calendar handling
 

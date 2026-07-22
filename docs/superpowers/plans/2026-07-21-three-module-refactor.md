@@ -8,6 +8,26 @@
 
 **Tech Stack:** Python 3.14, numba, numpy, xarray, dask.distributed, zarr (v2 format), flox, s3fs, geopandas, pytest.
 
+> **Status: executed.** All nine tasks are implemented on `pipeline-refactor`.
+> Four decisions in this plan were revised during implementation because they
+> were wrong or incomplete; the spec records the reasoning. If this plan and the
+> code disagree, the code is right.
+>
+> - **Spatial chunking.** This plan leaves it at the source store's native
+>   values. That breaks the first region write: the Texas bbox starts at
+>   latitude 701 / longitude 2803, both prime, so the cropped array's first
+>   chunk is a partial remainder. The crop is now snapped outward to native
+>   chunk boundaries instead.
+> - **`wet_bulb_temperature`.** `fastmath=True` sets LLVM's `nnan`, which folded
+>   away the clamp's `if/elif` and turned masked NaN cells into a finite
+>   `T - 40`. The flag set now omits `nnan`. A NaN early-out and stall detection
+>   were also added — masked cells were running the full 50-iteration cap.
+> - **Completion tracking.** This plan defers detecting incompletely written
+>   variables. That left a crash silently reporting success over all-NaN data,
+>   so per-year completion is now recorded in a store attribute.
+> - **Precision.** Raw AORC variables are float64 on disk and are now cast to
+>   float32 on read.
+
 ## Global Constraints
 
 - **Design spec:** `docs/superpowers/specs/2026-07-21-three-module-refactor-design.md`. Read it before starting.
