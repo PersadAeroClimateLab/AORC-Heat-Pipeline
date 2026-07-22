@@ -1,1 +1,20 @@
+# Numba caches compiled kernels to .nbi/.nbc next to the source. Baking those
+# into the image is a correctness hazard, not just bloat: a cache produced under
+# different fastmath flags can be served in place of the current source, and
+# this project's NaN handling depends on those exact flags. Always let the
+# container compile its own.
+__pycache__/
+*.pyc
+*.nbi
+*.nbc
+
+.git/
+.pytest_cache/
+.superpowers/
+
+# Large artifacts with no business in a build context.
 *.sif
+*.npz
+*.zarr/
+yearly_metrics_zarrs/
+output_zarrs/

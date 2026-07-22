@@ -13,6 +13,16 @@ Each function is self-contained and is checked against published values in
 import numba as nb
 import numpy as np
 
+#: Fast-math flags for kernels that branch on a value which may be NaN.
+#:
+#: `fastmath=True` includes `nnan`, which tells LLVM to assume no operand is
+#: ever NaN. Under that assumption a `x != x` guard is dead code and gets
+#: folded away, and an if/elif chain may be treated as exhaustive. Both
+#: matter here: the pipeline masks to a region with `.where`, so most cells
+#: arriving at these kernels ARE NaN. Every other fast-math relaxation is
+#: kept; only `nnan` and `ninf` are given up.
+NAN_SAFE_FASTMATH = {"nsz", "arcp", "contract", "afn", "reassoc"}
+
 CELSIUS_TO_FAHRENHEIT_SCALE = np.float32(1.8)
 CELSIUS_TO_FAHRENHEIT_OFFSET = np.float32(32.0)
 KELVIN_TO_CELSIUS_OFFSET = np.float32(273.15)
@@ -63,7 +73,7 @@ def kelvin_to_celsius(air_temperature_kelvin: float) -> float:
     return np.float32(air_temperature_kelvin) - KELVIN_TO_CELSIUS_OFFSET
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def saturation_vapor_pressure(air_temperature_celsius: float) -> float:
     """Saturation vapour pressure from the Tetens equation.
 
@@ -74,6 +84,11 @@ def saturation_vapor_pressure(air_temperature_celsius: float) -> float:
     :return: Saturation vapour pressure in hPa
     """
     temperature = np.float32(air_temperature_celsius)
+    # Masked cells arrive as NaN. Both branches below would return NaN anyway,
+    # but reaching the ordered comparison with a NaN operand raises the IEEE-754
+    # invalid-operation flag, which surfaces as a RuntimeWarning per chunk.
+    if temperature != temperature:
+        return np.float32(np.nan)
     if temperature > np.float32(0.0):
         return TETENS_REFERENCE_PRESSURE_HPA * np.exp(
             TETENS_WATER_NUMERATOR * temperature / (temperature + TETENS_WATER_DENOMINATOR)
@@ -83,7 +98,7 @@ def saturation_vapor_pressure(air_temperature_celsius: float) -> float:
     )
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def saturation_vapor_pressure_slope(air_temperature_celsius: float) -> float:
     """Temperature derivative of `saturation_vapor_pressure`.
 
@@ -95,6 +110,10 @@ def saturation_vapor_pressure_slope(air_temperature_celsius: float) -> float:
     :return: Rate of change of saturation vapour pressure, hPa per degree Celsius
     """
     temperature = np.float32(air_temperature_celsius)
+    # See `saturation_vapor_pressure`: guards the ordered comparison below
+    # against a NaN operand raising the invalid-operation flag.
+    if temperature != temperature:
+        return np.float32(np.nan)
     if temperature > np.float32(0.0):
         denominator = temperature + TETENS_WATER_DENOMINATOR
         saturation = TETENS_REFERENCE_PRESSURE_HPA * np.exp(
@@ -145,7 +164,7 @@ def relative_humidity(vapor_pressure_hpa: float, saturation_vapor_pressure_hpa: 
     ) * np.float32(100.0)
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def heat_index(air_temperature_fahrenheit: float, relative_humidity_percent: float) -> float:
     """Heat index from the National Weather Service Rothfusz regression.
 
@@ -160,6 +179,12 @@ def heat_index(air_temperature_fahrenheit: float, relative_humidity_percent: flo
     """
     temperature = np.float32(air_temperature_fahrenheit)
     humidity = np.float32(relative_humidity_percent)
+
+    # Masked cells arrive as NaN. Every branch below would yield NaN anyway, but
+    # the three ordered comparisons would each raise the IEEE-754
+    # invalid-operation flag on the way, surfacing as a RuntimeWarning per chunk.
+    if temperature != temperature or humidity != humidity:
+        return np.float32(np.nan)
 
     index = np.float32(0.5) * (
         temperature
@@ -272,10 +297,7 @@ LATENT_HEAT_SLOPE = np.float32(-2370.0)       # J/kg per degree Celsius
 #: `nnan` cannot be set here. `ninf` is dropped too, since the division by
 #: `residual_slope` can legitimately produce infinities. The remaining flags
 #: still give most of the fastmath speedup without licensing this collapse.
-WET_BULB_FASTMATH_FLAGS = {"nsz", "arcp", "contract", "afn", "reassoc"}
-
-
-@nb.vectorize(target="cpu", cache=True, fastmath=WET_BULB_FASTMATH_FLAGS)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def wet_bulb_temperature(
     air_temperature_celsius: float, specific_humidity: float, air_pressure_hpa: float
 ) -> float:
@@ -308,7 +330,7 @@ def wet_bulb_temperature(
     # cells in the bounding box are NaN. Returning NaN up front is both the
     # correct answer and far cheaper.
     #
-    # This check is only reliable because WET_BULB_FASTMATH_FLAGS omits `nnan`.
+    # This check is only reliable because NAN_SAFE_FASTMATH omits `nnan`.
     # Under `fastmath=True` LLVM assumes no operand is ever NaN and is free to
     # fold the comparison away.
     if (
