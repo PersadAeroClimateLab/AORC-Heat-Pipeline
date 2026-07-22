@@ -58,6 +58,27 @@ def test_inverted_year_range_is_rejected():
         )
 
 
+def test_zero_cores_is_rejected():
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            ["--output-dir", "/tmp/out", "--cores", "0", "--memory-limit", "10GB", "--all"]
+        )
+
+
+def test_negative_cores_is_rejected():
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            ["--output-dir", "/tmp/out", "--cores", "-1", "--memory-limit", "10GB", "--all"]
+        )
+
+
+def test_positive_cores_is_accepted():
+    arguments = cli.build_parser().parse_args(
+        BASE_ARGUMENTS + ["--all"]
+    )
+    assert arguments.cores == 8
+
+
 @pytest.mark.parametrize(
     "incomplete_arguments",
     [

@@ -14,6 +14,21 @@ DEFAULT_END_YEAR = 2024
 DASHBOARD_ADDRESS = ":8002"
 
 
+def _positive_integer(value):
+    """Validate that cores is a positive integer.
+
+    :param value: The value to validate
+    :return: The parsed integer
+    :raises argparse.ArgumentTypeError: If the value is not a positive integer
+    """
+    ivalue = int(value)
+    if ivalue < 1:
+        raise argparse.ArgumentTypeError(
+            f"cores must be at least 1, got {ivalue}"
+        )
+    return ivalue
+
+
 class _YearRangeParser(argparse.ArgumentParser):
     """Parser that rejects an inverted year range at parse time.
 
@@ -70,7 +85,7 @@ def build_parser():
     parser.add_argument(
         "--cores",
         required=True,
-        type=int,
+        type=_positive_integer,
         help="Number of Dask worker processes, one thread each.",
     )
     parser.add_argument(
