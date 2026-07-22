@@ -7,8 +7,14 @@ metrics that depend on vapour pressure resolve to a single node in the dask
 graph rather than four.
 
 Input is rechunked to 24 hours per chunk so each daily reduction group lives
-entirely inside one chunk. Spatial chunking is left at the store's native
-values.
+entirely inside one chunk. Spatial chunking is NOT left at the source store's
+native values: the pipeline imposes its own `SPATIAL_CHUNK_SIZE` chunking on
+the cropped region instead. The AORC store's native spatial chunk boundaries
+have nothing to do with where a region crop starts, so trusting them produces
+partial chunks at the front of the cropped array -- which then fail zarr's
+chunk-alignment check on the very first region write. Chunking the crop
+ourselves, from position zero, guarantees every chunk but the last is exactly
+`SPATIAL_CHUNK_SIZE` on a side.
 """
 
 from dataclasses import dataclass
@@ -18,7 +24,9 @@ from typing import Callable
 
 import dask.array
 import numpy as np
+import pandas as pd
 import xarray as xr
+import zarr
 
 from aorc_heat import core
 
@@ -33,6 +41,14 @@ NORTHWARD_WIND = "VGRD_10maboveground"
 HOURS_PER_DAY = 24
 DAILY_STATISTICS = ("min", "mean", "max")
 PASCALS_PER_HECTOPASCAL = np.float32(100.0)
+
+#: The one authoritative spatial chunk size for both the intermediate dask
+#: graph and the output zarr store. Deliberately independent of the source
+#: AORC store's native chunking -- see the module docstring for why. A final
+#: partial chunk at the far edge of a region is fine and writes correctly;
+#: only a partial *first* chunk breaks zarr's chunk-alignment check, and
+#: chunking the crop from position zero avoids that.
+SPATIAL_CHUNK_SIZE = 256
 
 GLOBAL_ATTRIBUTES = {
     "description": "Heat metrics derived from NOAA NWS AORC data provided via AWS S3 Zarr Bucket",
@@ -220,11 +236,14 @@ def required_variables(metric_names):
 
 
 def prepare_dataset(dataset, region):
-    """Crop to the region bounding box, mask, and rechunk to one day per chunk.
+    """Crop to the region bounding box, mask, and rechunk time and space.
 
     Chunking time in 24-hour blocks puts each daily resample group entirely
     inside one chunk, so the reduction never crosses a chunk boundary. Spatial
-    chunking is left at the store's native values.
+    chunking is imposed at `SPATIAL_CHUNK_SIZE` on the *cropped* array rather
+    than inherited from the source store: the crop's own start position, not
+    the source store's native chunk boundaries, is what has to line up with
+    chunk zero, and chunking from position zero here guarantees that.
 
     :param dataset: Full-domain AORC dataset
     :param region: A `mask.Region` describing the area of interest
@@ -233,7 +252,13 @@ def prepare_dataset(dataset, region):
     cropped = dataset.isel(
         latitude=region.latitude_slice, longitude=region.longitude_slice
     )
-    return cropped.where(region.mask).chunk({"time": HOURS_PER_DAY})
+    return cropped.where(region.mask).chunk(
+        {
+            "time": HOURS_PER_DAY,
+            "latitude": SPATIAL_CHUNK_SIZE,
+            "longitude": SPATIAL_CHUNK_SIZE,
+        }
+    )
 
 
 def daily_metrics(aorc_dataset, metric_names):
@@ -322,17 +347,123 @@ def time_region(time_axis, block_index):
     return slice(start, stop)
 
 
+#: Zarr group attribute holding, per metric, the sorted list of calendar years
+#: that have actually been written (as opposed to merely allocated as NaN).
+#: See `record_completed_years` and `pending_metrics`.
+COMPLETED_YEARS_ATTR = "completed_years"
+
+
+def _as_comparable_dates(time_index):
+    """Reduce a time index to plain (year, month, day) tuples for comparison.
+
+    `daily_time_axis` builds a `CFTimeIndex` of cftime objects, but xarray
+    silently decodes a "standard"-calendar time coordinate read back from zarr
+    into a plain `DatetimeIndex` of `numpy.datetime64` instead (it is
+    representable as one, so xarray prefers it), which has no `.year`
+    attribute. Normalising both flavours to plain (year, month, day) tuples
+    makes an existing store's time coordinate and a freshly built time axis
+    comparable regardless of which representation either one arrived in.
+
+    :param time_index: A time index (e.g. `Dataset.indexes["time"]`, or a
+        `CFTimeIndex` from `daily_time_axis`)
+    :return: List of (year, month, day) tuples
+    """
+    dates = []
+    for timestamp in np.asarray(time_index):
+        if isinstance(timestamp, np.datetime64):
+            timestamp = pd.Timestamp(timestamp)
+        dates.append((timestamp.year, timestamp.month, timestamp.day))
+    return dates
+
+
+def _validate_time_axis(existing, time_axis, store_path):
+    """Raise unless the store's time axis is exactly the requested one.
+
+    Comparing only `.size` lets two different ranges of equal length -- for
+    example 1999-2000 and 2000-2001 -- pass as equivalent, which then lets
+    `initialize_output_store` silently relabel the store's existing time
+    coordinate out from under data already written for a different metric.
+    Comparing the actual calendar dates closes that gap.
+
+    :param existing: The already-open existing store's Dataset
+    :param time_axis: The time axis the caller is requesting
+    :param store_path: Path to the store, for the error message
+    """
+    existing_time = existing.indexes["time"]
+    if existing_time.size == time_axis.size and np.array_equal(
+        _as_comparable_dates(existing_time), _as_comparable_dates(time_axis)
+    ):
+        return
+
+    def _span(index):
+        first, last = index[0], index[-1]
+        return (
+            f"{first.year:04d}-{first.month:02d}-{first.day:02d} to "
+            f"{last.year:04d}-{last.month:02d}-{last.day:02d} ({index.size} days)"
+        )
+
+    raise ValueError(
+        f"Existing store at {store_path} spans {_span(existing_time)}, "
+        f"which does not match the {_span(time_axis)} requested. "
+        "Delete the store or request the range it already covers."
+    )
+
+
+def _read_completed_years(store_path):
+    """The `COMPLETED_YEARS_ATTR` attribute from a store, or an empty mapping.
+
+    :param store_path: Path to the output zarr store
+    :return: Mapping of metric name to the set of years recorded as written
+    """
+    group = zarr.open_group(str(store_path), mode="r")
+    raw = group.attrs.get(COMPLETED_YEARS_ATTR, {})
+    return {name: set(years) for name, years in raw.items()}
+
+
+def record_completed_years(store_path, metric_names, years):
+    """Record that `years` were actually written for `metric_names`.
+
+    `initialize_output_store` allocates a metric's variables, NaN-filled,
+    before any year is computed. Without an explicit completion record, a
+    crash between allocation and the first successful write leaves a store
+    that looks finished -- the variables exist -- but holds no real data, and
+    a subsequent run would silently report nothing to do. Recording progress
+    explicitly, per year, closes that gap: a metric is only ever reported as
+    done when every requested year has actually been written.
+
+    :param store_path: Path to the output zarr store
+    :param metric_names: Metrics that were just written for `years`
+    :param years: Calendar years that were successfully written
+    """
+    store_path = Path(store_path)
+    group = zarr.open_group(str(store_path), mode="a")
+    completed = {name: set(existing) for name, existing in group.attrs.get(COMPLETED_YEARS_ATTR, {}).items()}
+    for name in metric_names:
+        completed.setdefault(name, set()).update(years)
+    group.attrs[COMPLETED_YEARS_ATTR] = {
+        name: sorted(recorded_years) for name, recorded_years in completed.items()
+    }
+    # Attribute writes go through the plain (unconsolidated) metadata; without
+    # re-consolidating, `xr.open_zarr(..., consolidated=True)` would keep
+    # reading the stale, pre-update attributes.
+    zarr.consolidate_metadata(str(store_path))
+
+
 def pending_metrics(store_path, metric_names, time_axis):
     """Metrics that still need computing, after validating the existing store.
 
-    A metric counts as present when its `_mean` variable exists. This does not
-    verify that every year was written; see the known limitation in the design
-    spec.
+    A metric counts as done only when its `_mean` variable exists AND its
+    recorded completed-years (see `record_completed_years`) cover every year
+    in `time_axis`. Variables existing alone is not enough: they are allocated
+    NaN-filled up front, before any year is actually computed, so a metric
+    whose completion record is missing or incomplete is reported as pending
+    so the run redoes it -- silently reporting success on all-NaN data would
+    be worse than repeating the work.
 
     :param store_path: Path to the output zarr store
     :param metric_names: Requested metric names
     :param time_axis: Expected daily time axis
-    :return: The subset of `metric_names` not already in the store
+    :return: The subset of `metric_names` not already fully in the store
     """
     _validate_metric_names(metric_names)
     store_path = Path(store_path)
@@ -340,13 +471,18 @@ def pending_metrics(store_path, metric_names, time_axis):
         return list(metric_names)
 
     existing = xr.open_zarr(store_path, consolidated=True)
-    if existing.sizes.get("time") != time_axis.size:
-        raise ValueError(
-            f"Existing store at {store_path} spans {existing.sizes.get('time')} days, "
-            f"which does not match the {time_axis.size} days requested. "
-            "Delete the store or request the range it already covers."
-        )
-    return [name for name in metric_names if f"{name}_mean" not in existing.data_vars]
+    _validate_time_axis(existing, time_axis, store_path)
+
+    required_years = {timestamp.year for timestamp in np.asarray(time_axis)}
+    completed_years = _read_completed_years(store_path)
+
+    pending = []
+    for name in metric_names:
+        if f"{name}_mean" not in existing.data_vars:
+            pending.append(name)
+        elif not required_years.issubset(completed_years.get(name, set())):
+            pending.append(name)
+    return pending
 
 
 def initialize_output_store(store_path, metric_names, time_axis, template):
@@ -355,6 +491,16 @@ def initialize_output_store(store_path, metric_names, time_axis, template):
     Creates the store when absent, otherwise appends the new variables to it.
     The template supplies the spatial coordinates and chunk sizes.
 
+    A metric already reported by `pending_metrics` can still have its
+    variables already sitting in the store -- that is exactly the
+    crash-then-rerun case `pending_metrics` exists to catch (variables
+    allocated by an earlier, incomplete run, whose completed-years record is
+    missing or partial). Re-declaring an already-existing zarr variable with
+    fresh encoding is both unnecessary and rejected outright by xarray, so
+    allocation here is limited to genuinely new variables; anything already
+    present is left as-is and simply gets overwritten in place by the write
+    loop that follows.
+
     :param store_path: Path to the output zarr store
     :param metric_names: Metrics to allocate
     :param time_axis: Full daily time axis
@@ -362,7 +508,8 @@ def initialize_output_store(store_path, metric_names, time_axis, template):
     """
     store_path = Path(store_path)
     spatial_chunks = tuple(
-        template.chunksizes[dimension][0] for dimension in ("latitude", "longitude")
+        min(SPATIAL_CHUNK_SIZE, template.sizes[dimension])
+        for dimension in ("latitude", "longitude")
     )
     shape = (time_axis.size, template.sizes["latitude"], template.sizes["longitude"])
     chunks = (OUTPUT_TIME_CHUNK_DAYS,) + spatial_chunks
@@ -375,6 +522,9 @@ def initialize_output_store(store_path, metric_names, time_axis, template):
                     f"Existing store at {store_path} has a different {dimension} axis "
                     "than the requested region. Delete the store to rebuild it."
                 )
+        metric_names = [name for name in metric_names if f"{name}_mean" not in existing.data_vars]
+        if not metric_names:
+            return
 
     placeholder = dask.array.full(shape, np.nan, dtype=np.float32, chunks=chunks)
     variables = {
@@ -414,8 +564,12 @@ def write_block(store_path, daily, time_axis):
     """Write a contiguous block of daily metrics into its region of the store.
 
     The block is converted to the store's calendar and rechunked to one day per
-    chunk so the write aligns exactly with the store's chunking. Coordinate
-    variables are dropped because they already exist in the store.
+    chunk in time and `SPATIAL_CHUNK_SIZE` in space so the write aligns exactly
+    with the store's chunking. This rechunk is not a no-op safety net: it is
+    trusted to *make* the block's chunks match the store rather than to merely
+    confirm they already do, since the incoming block's chunking depends on
+    upstream operations this function does not control. Coordinate variables
+    are dropped because they already exist in the store.
 
     :param store_path: Path to the output zarr store
     :param daily: A contiguous block of `daily_metrics` output
@@ -423,7 +577,11 @@ def write_block(store_path, daily, time_axis):
     """
     aligned = daily.convert_calendar("standard", use_cftime=True)
     region = time_region(time_axis, aligned.indexes["time"])
-    aligned = aligned.chunk({"time": OUTPUT_TIME_CHUNK_DAYS})
+    spatial_chunks = {
+        dimension: min(SPATIAL_CHUNK_SIZE, aligned.sizes[dimension])
+        for dimension in ("latitude", "longitude")
+    }
+    aligned = aligned.chunk({"time": OUTPUT_TIME_CHUNK_DAYS, **spatial_chunks})
     aligned = aligned.drop_vars(list(aligned.coords))
     aligned.to_zarr(Path(store_path), region={"time": region})
 
@@ -494,6 +652,10 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
         _log(f"[compute] Deriving metrics for {year}.")
         dataset = open_aorc_year(year, region, variables, filesystem)
         write_block(store_path, daily_metrics(dataset, pending), time_axis)
+        # Recorded only after the write above actually succeeds, so a crash
+        # mid-write leaves the year unrecorded and `pending_metrics` correctly
+        # reports the metric as still pending on the next run.
+        record_completed_years(store_path, pending, [year])
         _log(f"[compute] Wrote {year}.")
 
     _log("[final] Finished.")

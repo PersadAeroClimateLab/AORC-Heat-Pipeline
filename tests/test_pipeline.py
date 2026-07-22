@@ -187,6 +187,103 @@ def test_prepare_dataset_crops_masks_and_chunks(synthetic_aorc_dataset):
     assert bool(np.isnan(loaded["TMP_2maboveground"].isel(latitude=1, longitude=1)).all())
 
 
+def test_prepare_dataset_imposes_its_own_spatial_chunking(synthetic_aorc_dataset):
+    """`prepare_dataset` must not inherit the source store's spatial chunking.
+
+    The 2x2 synthetic grid is far smaller than `SPATIAL_CHUNK_SIZE`, so dask
+    collapses it to a single spatial chunk either way; this only checks that
+    the dimension is chunked at all (rather than left as one native chunk
+    that happens to also be size 2). The real, size-dependent behaviour is
+    covered by `test_write_block_succeeds_when_the_crop_does_not_start_on_a_chunk_boundary`.
+    """
+    from aorc_heat.mask import Region
+
+    mask = xr.DataArray(
+        np.ones((2, 2), dtype=bool),
+        dims=("latitude", "longitude"),
+        coords={
+            "latitude": synthetic_aorc_dataset.latitude,
+            "longitude": synthetic_aorc_dataset.longitude,
+        },
+    )
+    region = Region(mask=mask, latitude_slice=slice(0, 2), longitude_slice=slice(0, 2))
+
+    prepared = pipeline.prepare_dataset(synthetic_aorc_dataset, region)
+
+    assert prepared.chunksizes["latitude"] == (2,)
+    assert prepared.chunksizes["longitude"] == (2,)
+
+
+def test_write_block_succeeds_when_the_crop_does_not_start_on_a_chunk_boundary(tmp_path):
+    """A region write must succeed when the crop starts mid native-chunk.
+
+    Mirrors the real Texas bounding box crop, whose start indices (701, 2803
+    into the AORC domain) are prime and so never land on a native chunk
+    boundary no matter what chunk size the source store used. Before the fix,
+    `prepare_dataset` inherited that native spatial chunking, so
+    `initialize_output_store` derived a declared zarr chunk size from a
+    partial first dask chunk, and `write_block` handed xarray dask chunks that
+    didn't match it -- raising a "would overlap multiple Dask chunks" error on
+    the very first write. This builds a synthetic "source store" natively
+    chunked at sizes that don't divide the crop's start index, to reproduce
+    that misalignment, and asserts the write completes instead.
+    """
+    from aorc_heat.mask import Region
+
+    domain_size = 320
+    crop_length = 290  # bigger than SPATIAL_CHUNK_SIZE, so the crop spans a
+    # full 256 chunk plus a smaller final one -- proving a partial *last*
+    # chunk is fine while a partial *first* chunk (what this test guards
+    # against) is not.
+    latitude_start, longitude_start = 5, 11  # neither divides the native chunk sizes below
+
+    full_latitudes = np.arange(domain_size, dtype=np.float64)
+    full_longitudes = np.arange(domain_size, dtype=np.float64)
+    hours = 48
+    times = xr.date_range("2000-07-01", periods=hours, freq="h", use_cftime=True, calendar="standard")
+    shape = (hours, domain_size, domain_size)
+    generator = np.random.default_rng(seed=99)
+
+    def field(low, high):
+        return generator.uniform(low, high, size=shape).astype(np.float32)
+
+    full_domain = xr.Dataset(
+        {
+            "TMP_2maboveground": (("time", "latitude", "longitude"), field(295.0, 315.0)),
+            "SPFH_2maboveground": (("time", "latitude", "longitude"), field(0.005, 0.018)),
+            "PRES_surface": (("time", "latitude", "longitude"), field(98000.0, 101500.0)),
+        },
+        coords={"time": times, "latitude": full_latitudes, "longitude": full_longitudes},
+    ).chunk({"time": 24, "latitude": 41, "longitude": 43})  # native chunk sizes, both prime
+
+    latitude_slice = slice(latitude_start, latitude_start + crop_length)
+    longitude_slice = slice(longitude_start, longitude_start + crop_length)
+    mask = xr.DataArray(
+        np.ones((crop_length, crop_length), dtype=bool),
+        dims=("latitude", "longitude"),
+        coords={
+            "latitude": full_domain.latitude.isel(latitude=latitude_slice),
+            "longitude": full_domain.longitude.isel(longitude=longitude_slice),
+        },
+    )
+    region = Region(mask=mask, latitude_slice=latitude_slice, longitude_slice=longitude_slice)
+
+    prepared = pipeline.prepare_dataset(full_domain, region)
+    daily = pipeline.daily_metrics(prepared, ["humidex"])
+
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, daily)
+
+    # This must not raise the zarr "would overlap multiple Dask chunks" error.
+    pipeline.write_block(store_path, daily, axis)
+
+    written = xr.open_zarr(store_path, consolidated=True).compute()
+    # The synthetic data covers 1-2 July 2000: days 182 and 183 of a leap year.
+    assert not bool(np.isnan(written["humidex_mean"].isel(time=slice(182, 184))).any())
+    assert bool(np.isnan(written["humidex_mean"].isel(time=0)).all())
+
+
 # ---------------------------------------------------------------------------
 # Output store
 # ---------------------------------------------------------------------------
@@ -256,10 +353,39 @@ def test_pending_metrics_skips_what_is_already_present(tmp_path, synthetic_aorc_
         "heat_index",
     ]
 
-    pipeline.initialize_output_store(
-        store_path, ["humidex"], axis, _template_for(synthetic_aorc_dataset, ["humidex"])
-    )
+    template = _template_for(synthetic_aorc_dataset, ["humidex"])
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, template)
+    pipeline.write_block(store_path, template, axis)
+    pipeline.record_completed_years(store_path, ["humidex"], [2000])
     assert pipeline.pending_metrics(store_path, ["humidex", "heat_index"], axis) == ["heat_index"]
+
+
+def test_pending_metrics_stays_pending_until_every_requested_year_is_recorded(
+    tmp_path, synthetic_aorc_dataset
+):
+    """Allocating a metric's variables must not, by itself, mark it done.
+
+    `initialize_output_store` allocates NaN-filled variables before any year is
+    computed. If a crash happens right after that -- which is exactly what
+    Finding 1 does on the very first region write -- re-running must recompute
+    rather than report "nothing to compute" against all-NaN data.
+    """
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(1999, 2000)
+    template = _template_for(synthetic_aorc_dataset, ["humidex"])
+
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, template)
+    # Variables exist now, but nothing has actually been written or recorded.
+    assert pipeline.pending_metrics(store_path, ["humidex"], axis) == ["humidex"]
+
+    pipeline.write_block(store_path, template, axis)
+    pipeline.record_completed_years(store_path, ["humidex"], [2000])
+    # Only one of the two requested years (1999, 2000) is recorded complete.
+    assert pipeline.pending_metrics(store_path, ["humidex"], axis) == ["humidex"]
+
+    pipeline.record_completed_years(store_path, ["humidex"], [1999])
+    # Both years recorded now: the metric is finally done.
+    assert pipeline.pending_metrics(store_path, ["humidex"], axis) == []
 
 
 def test_pending_metrics_rejects_time_axis_mismatch(tmp_path, synthetic_aorc_dataset):
@@ -273,6 +399,31 @@ def test_pending_metrics_rejects_time_axis_mismatch(tmp_path, synthetic_aorc_dat
 
     with pytest.raises(ValueError, match="does not match"):
         pipeline.pending_metrics(store_path, ["heat_index"], pipeline.daily_time_axis(1999, 2001))
+
+
+def test_pending_metrics_rejects_a_shifted_range_of_the_same_length(tmp_path, synthetic_aorc_dataset):
+    """Two different ranges can have identical day counts and must not be confused.
+
+    1999-2000 spans 365 + 366 = 731 days; 2000-2001 spans 366 + 365 = 731 days
+    too. A length-only check lets the second silently pass validation against a
+    store built for the first, which then lets `initialize_output_store`
+    relabel the existing time coordinate -- so already-written data for one
+    date would be reported back under a different date.
+    """
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    original_axis = pipeline.daily_time_axis(1999, 2000)
+    shifted_axis = pipeline.daily_time_axis(2000, 2001)
+    assert original_axis.size == shifted_axis.size
+
+    pipeline.initialize_output_store(
+        store_path,
+        ["humidex"],
+        original_axis,
+        _template_for(synthetic_aorc_dataset, ["humidex"]),
+    )
+
+    with pytest.raises(ValueError, match="does not match"):
+        pipeline.pending_metrics(store_path, ["heat_index"], shifted_axis)
 
 
 def test_unwritten_days_read_back_as_nan(tmp_path, synthetic_aorc_dataset):
