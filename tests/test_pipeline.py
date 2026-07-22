@@ -389,7 +389,7 @@ def test_initialize_output_store_creates_requested_variables(tmp_path, synthetic
     written = xr.open_zarr(store_path, consolidated=True)
     assert sorted(written.data_vars) == ["humidex_max", "humidex_mean", "humidex_min"]
     assert written.sizes["time"] == 366
-    assert written.chunksizes["time"][0] == 1
+    assert written.chunksizes["time"][0] == pipeline.OUTPUT_TIME_CHUNK_DAYS
 
 
 def test_initialize_output_store_appends_new_metrics(tmp_path, synthetic_aorc_dataset):
@@ -536,3 +536,90 @@ def test_adding_a_metric_leaves_earlier_values_untouched(tmp_path, synthetic_aor
     after = xr.open_zarr(store_path, consolidated=True)
     np.testing.assert_array_equal(before.values, after["humidex_mean"].compute().values)
     assert "simplified_wbgt_mean" in after.data_vars
+
+
+# ---------------------------------------------------------------------------
+# Store chunk alignment across year boundaries
+# ---------------------------------------------------------------------------
+def test_chunk_sizes_aligned_to_store_splits_at_boundaries():
+    """Every returned chunk must fall inside exactly one store chunk."""
+    # A block starting on a boundary and ending past the next one.
+    assert pipeline.chunk_sizes_aligned_to_store(365, 731, 365) == (365, 1)
+    # A block starting mid-chunk (the usual case after a leap year).
+    assert pipeline.chunk_sizes_aligned_to_store(731, 1096, 365) == (364, 1)
+    # A block exactly filling one chunk.
+    assert pipeline.chunk_sizes_aligned_to_store(0, 365, 365) == (365,)
+    # A block smaller than a chunk and wholly inside one.
+    assert pipeline.chunk_sizes_aligned_to_store(10, 20, 365) == (10,)
+
+
+@pytest.mark.parametrize(
+    "start, stop, chunk",
+    [(0, 365, 365), (365, 731, 365), (731, 1096, 365), (5, 900, 90), (89, 271, 90)],
+)
+def test_chunk_sizes_aligned_to_store_are_sound(start, stop, chunk):
+    """Sizes must sum to the block length, and no chunk may cross a boundary."""
+    sizes = pipeline.chunk_sizes_aligned_to_store(start, stop, chunk)
+    assert sum(sizes) == stop - start
+
+    position = start
+    for size in sizes:
+        # The chunk this piece lands in, at its first and last index, must match.
+        assert position // chunk == (position + size - 1) // chunk
+        position += size
+
+
+def test_consecutive_year_writes_preserve_the_shared_boundary_chunk(tmp_path):
+    """The chunk straddling two years must retain both years' data.
+
+    With a 365-day store chunk and alternating 365/366-day years, adjacent
+    years share the chunk at their boundary: one writes its tail, the next
+    writes its head. Correctness depends on zarr read-modify-writing that chunk
+    rather than replacing it. This is the assumption `write_block`'s contract
+    rests on, so it is checked directly: each day is stamped with its own index
+    in the store's axis, and every day of both years must read back as itself.
+    """
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(1999, 2000)  # 365 + 366, boundary mid-chunk
+    latitudes, longitudes = np.array([30.0, 31.0]), np.array([-100.0, -99.0])
+
+    def block_for(year):
+        days = 365 if year == 1999 else 366
+        times = xr.date_range(
+            f"{year}-01-01", periods=days, freq="D", use_cftime=True, calendar="standard"
+        )
+        offset = 0 if year == 1999 else 365
+        # Value == the day's index in the full store axis, so a misplaced or
+        # clobbered day is immediately visible rather than plausible.
+        values = np.repeat(
+            (np.arange(days, dtype=np.float32) + offset)[:, None, None], 2, axis=1
+        ).repeat(2, axis=2)
+        return xr.Dataset(
+            {"humidex_mean": (("time", "latitude", "longitude"), values)},
+            coords={"time": times, "latitude": latitudes, "longitude": longitudes},
+        ).chunk({"time": 50})  # deliberately misaligned with the store's 365
+
+    template = block_for(1999)
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, template)
+    pipeline.write_block(store_path, block_for(1999), axis)
+    pipeline.write_block(store_path, block_for(2000), axis)
+
+    written = xr.open_zarr(store_path, consolidated=True)["humidex_mean"].compute()
+    assert written.sizes["time"] == 731
+    expected = np.arange(731, dtype=np.float32)
+    np.testing.assert_array_equal(written.isel(latitude=0, longitude=0).values, expected)
+    # Day 364 (end of 1999) and day 365 (start of 2000) share store chunk 1.
+    assert float(written.isel(time=364, latitude=0, longitude=0)) == 364.0
+    assert float(written.isel(time=365, latitude=0, longitude=0)) == 365.0
+
+
+def test_output_store_uses_the_configured_time_chunk(tmp_path, synthetic_aorc_dataset):
+    """The store must actually be allocated at OUTPUT_TIME_CHUNK_DAYS."""
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+    template = pipeline.daily_metrics(synthetic_aorc_dataset, ["humidex"])
+
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, template)
+
+    written = xr.open_zarr(store_path, consolidated=True)
+    assert written.chunksizes["time"][0] == pipeline.OUTPUT_TIME_CHUNK_DAYS

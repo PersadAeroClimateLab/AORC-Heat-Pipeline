@@ -304,12 +304,16 @@ def daily_metrics(aorc_dataset, metric_names):
 
 OUTPUT_STORE_NAME = "aorc_heat_metrics.zarr"
 
-#: Output time chunk, in days. One day per chunk is deliberate: the input is
-#: chunked at 24 hours, so each daily result is already one chunk along time and
-#: every yearly region write lands exactly on chunk boundaries. Any larger value
-#: would leave partial chunks at year boundaries, which two different region
-#: writes could then race on.
-OUTPUT_TIME_CHUNK_DAYS = 1
+#: Output time chunk, in days, giving ~48 MB chunks alongside the native
+#: (128, 256) spatial chunking. Sized for reading long time series at a point,
+#: the dominant access pattern for trend work.
+#:
+#: This cannot divide the year boundaries: years alternate 365 and 366 days, so
+#: no fixed chunk size lines up with every year's start. Each yearly write
+#: therefore lands partially inside the chunks at its two ends. That is safe
+#: here, but only because of how `write_block` and `run` are arranged -- see the
+#: contract on `write_block` before changing either.
+OUTPUT_TIME_CHUNK_DAYS = 365
 
 OUTPUT_DIMENSIONS = ("time", "latitude", "longitude")
 
@@ -580,15 +584,51 @@ def initialize_output_store(store_path, metric_names, time_axis, template):
     )
 
 
+def chunk_sizes_aligned_to_store(start, stop, chunk):
+    """Dask chunk sizes for [start, stop) that never straddle a store boundary.
+
+    A block written into the middle of the store generally starts mid-chunk,
+    because year lengths alternate 365/366 and no fixed chunk size divides every
+    year boundary. Splitting the block at the store's own boundaries means each
+    resulting dask chunk falls inside exactly one store chunk, so no two tasks
+    in a single write ever target the same chunk.
+
+    :param start: First index of the block within the store's axis
+    :param stop: One past the block's last index
+    :param chunk: The store's chunk size along that axis
+    :return: Tuple of dask chunk sizes summing to stop - start
+    """
+    sizes = []
+    position = start
+    while position < stop:
+        next_boundary = min((position // chunk + 1) * chunk, stop)
+        sizes.append(next_boundary - position)
+        position = next_boundary
+    return tuple(sizes)
+
+
 def write_block(store_path, daily, time_axis):
     """Write a contiguous block of daily metrics into its region of the store.
 
-    The block is converted to the store's calendar and rechunked to one day per
-    chunk in time. Spatial chunks are left untouched: they came from the source
-    store via a chunk-boundary-snapped crop, and the output store was allocated
-    with those same sizes, so they already align. Rechunking them here would be
-    a no-op that costs a graph layer. Coordinate variables are dropped because
+    The block is converted to the store's calendar, then split along time at the
+    store's chunk boundaries so no dask chunk spans two store chunks. Spatial
+    chunks are left untouched: they came from the source store via a
+    chunk-boundary-snapped crop, and the output store was allocated with those
+    same sizes, so they already align. Coordinate variables are dropped because
     they already exist in the store.
+
+    **Contract: callers must write blocks one at a time, never concurrently.**
+    `safe_chunks=False` is required because a block's first and last chunks land
+    partway into a store chunk, which xarray otherwise refuses. That refusal
+    guards against a real hazard -- two tasks read-modify-writing one chunk and
+    losing an update. Two things make it safe here, and both must hold:
+
+    1. Within a write, the split above gives every dask chunk its own store
+       chunk, so no two tasks in the same graph collide.
+    2. Across writes, adjacent blocks do share the chunk straddling their
+       boundary, and correctness rests on zarr read-modify-writing it. That is
+       only sound while writes are sequential. Parallelising `run`'s year loop
+       would silently corrupt one day at each year boundary.
 
     :param store_path: Path to the output zarr store
     :param daily: A contiguous block of `daily_metrics` output
@@ -596,9 +636,13 @@ def write_block(store_path, daily, time_axis):
     """
     aligned = daily.convert_calendar("standard", use_cftime=True)
     region = time_region(time_axis, aligned.indexes["time"])
-    aligned = aligned.chunk({"time": OUTPUT_TIME_CHUNK_DAYS})
+    aligned = aligned.chunk(
+        {"time": chunk_sizes_aligned_to_store(
+            region.start, region.stop, OUTPUT_TIME_CHUNK_DAYS
+        )}
+    )
     aligned = aligned.drop_vars(list(aligned.coords))
-    aligned.to_zarr(Path(store_path), region={"time": region})
+    aligned.to_zarr(Path(store_path), region={"time": region}, safe_chunks=False)
 
 
 def open_aorc_year(year, region, variable_names, filesystem=None):
