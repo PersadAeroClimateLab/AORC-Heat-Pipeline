@@ -623,3 +623,69 @@ def test_output_store_uses_the_configured_time_chunk(tmp_path, synthetic_aorc_da
 
     written = xr.open_zarr(store_path, consolidated=True)
     assert written.chunksizes["time"][0] == pipeline.OUTPUT_TIME_CHUNK_DAYS
+
+
+def test_masked_cells_do_not_emit_runtime_warnings(synthetic_aorc_dataset):
+    """A masked region must compute silently.
+
+    Masked cells are NaN by design, and the branchy kernels raise IEEE-754's
+    invalid-operation flag on SIMD lanes whose results are discarded. The
+    results stay correct, so the pipeline suppresses the resulting warning; this
+    check keeps that suppression working end to end rather than by inspection.
+    """
+    import warnings
+
+    from aorc_heat.mask import Region
+
+    # Large enough to exceed the SIMD width where if-conversion kicks in.
+    grid = 32
+    hours = 48
+    times = xr.date_range(
+        "2000-07-01", periods=hours, freq="h", use_cftime=True, calendar="standard"
+    )
+    generator = np.random.default_rng(7)
+    shape = (hours, grid, grid)
+
+    def field(low, high):
+        return generator.uniform(low, high, size=shape).astype(np.float64)
+
+    dataset = xr.Dataset(
+        {
+            "TMP_2maboveground": (("time", "latitude", "longitude"), field(295.0, 315.0)),
+            "SPFH_2maboveground": (("time", "latitude", "longitude"), field(0.005, 0.018)),
+            "PRES_surface": (("time", "latitude", "longitude"), field(98000.0, 101500.0)),
+            "UGRD_10maboveground": (("time", "latitude", "longitude"), field(-8.0, 8.0)),
+            "VGRD_10maboveground": (("time", "latitude", "longitude"), field(-8.0, 8.0)),
+        },
+        coords={
+            "time": times,
+            "latitude": np.arange(float(grid)),
+            "longitude": np.arange(float(grid)),
+        },
+    ).chunk({"time": 24})
+
+    selected = np.zeros((grid, grid), dtype=bool)
+    selected[8:24, 8:24] = True  # most of the region masked out, as in Texas
+    mask = xr.DataArray(
+        selected,
+        dims=("latitude", "longitude"),
+        coords={"latitude": dataset.latitude, "longitude": dataset.longitude},
+    )
+    region = Region(mask=mask, latitude_slice=slice(0, grid), longitude_slice=slice(0, grid))
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        prepared = pipeline.prepare_dataset(dataset, region)
+        result = pipeline.daily_metrics(prepared, ALL_METRICS).compute()
+
+    runtime_warnings = [
+        str(w.message) for w in caught if issubclass(w.category, RuntimeWarning)
+    ]
+    assert not runtime_warnings, runtime_warnings
+
+    # And the results are still right: masked NaN, unmasked finite.
+    inside = mask.values
+    for name in ALL_METRICS:
+        values = result[f"{name}_mean"].values
+        assert np.isnan(values[:, ~inside]).all(), name
+        assert np.isfinite(values[:, inside]).all(), name

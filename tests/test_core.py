@@ -304,3 +304,55 @@ def test_wet_bulb_temperature_zero_humidity_is_finite_and_bounded():
     result = core.wet_bulb_temperature(25.0, 0.0, 1013.25)
     assert np.isfinite(result)
     assert result <= 25.0 + 1e-4
+
+
+# ---------------------------------------------------------------------------
+# Finite inputs must never produce non-finite outputs
+# ---------------------------------------------------------------------------
+# `pipeline._quiet_on_masked_nan` suppresses numpy's invalid-operation warning
+# for these kernels, because masked cells are NaN by design and SIMD
+# if-conversion raises the flag on lanes whose results are discarded. That
+# suppression is only safe while a genuine bad computation would still be
+# caught -- which is this test's job. If it ever fails, the suppression is
+# hiding a real defect and must be removed, not adjusted.
+def test_finite_inputs_never_produce_non_finite_outputs():
+    temperatures = np.linspace(-60.0, 60.0, 240, dtype=np.float32)
+    humidities = np.linspace(0.0, 0.05, 120, dtype=np.float32)
+    pressures = np.linspace(500.0, 1100.0, 40, dtype=np.float32)
+
+    grid_t, grid_q = np.meshgrid(temperatures, humidities, indexing="ij")
+    grid_t, grid_q = grid_t.ravel(), grid_q.ravel()
+    reference_pressure = np.full(grid_t.size, 1013.25, dtype=np.float32)
+
+    saturation = core.saturation_vapor_pressure(grid_t)
+    slope = core.saturation_vapor_pressure_slope(grid_t)
+    vapor = core.vapor_pressure(grid_q, reference_pressure)
+    humidity_percent = core.relative_humidity(vapor, saturation)
+    index = core.heat_index(core.celsius_to_fahrenheit(grid_t), humidity_percent)
+    apparent = core.apparent_temperature(grid_t, vapor, np.full_like(grid_t, 5.0))
+    humid = core.humidex(grid_t, vapor)
+    wbgt = core.simplified_wbgt(grid_t, vapor)
+
+    for name, values in (
+        ("saturation_vapor_pressure", saturation),
+        ("saturation_vapor_pressure_slope", slope),
+        ("vapor_pressure", vapor),
+        ("relative_humidity", humidity_percent),
+        ("heat_index", index),
+        ("apparent_temperature", apparent),
+        ("humidex", humid),
+        ("simplified_wbgt", wbgt),
+    ):
+        assert np.isfinite(values).all(), (
+            f"{name} produced {int((~np.isfinite(values)).sum())} non-finite "
+            "values from finite inputs"
+        )
+
+    mesh_t, mesh_q, mesh_p = np.meshgrid(
+        temperatures[::3], humidities[::3], pressures[::3], indexing="ij"
+    )
+    wet_bulb = core.wet_bulb_temperature(mesh_t.ravel(), mesh_q.ravel(), mesh_p.ravel())
+    assert np.isfinite(wet_bulb).all(), (
+        f"wet_bulb_temperature produced {int((~np.isfinite(wet_bulb)).sum())} "
+        "non-finite values from finite inputs"
+    )

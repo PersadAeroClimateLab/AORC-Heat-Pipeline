@@ -56,10 +56,44 @@ GLOBAL_ATTRIBUTES = {
 }
 
 
+def _quiet_on_masked_nan(kernel):
+    """Wrap a `core` kernel so masked cells do not raise spurious FP warnings.
+
+    `prepare_dataset` masks with `.where`, so most cells reaching these kernels
+    are NaN by design. The kernels handle that correctly -- NaN in, NaN out --
+    but the branchy ones still emit
+    "RuntimeWarning: invalid value encountered in ...", once per block, which
+    on a 46-year run buries anything worth reading.
+
+    The warning is an artefact of vectorisation, not a bad computation. Above
+    the SIMD width (measured: exactly 8 float32 lanes, one AVX register) LLVM
+    if-converts the branches into selects and evaluates *both* sides for *all*
+    lanes. The NaN lanes reach an ordered comparison, which IEEE-754 says must
+    raise the invalid-operation flag, and numpy reports that flag after the
+    loop even though those lanes' results are discarded by the select.
+
+    Suppressing `invalid` here is narrow -- it covers only kernels this module
+    deliberately feeds NaN -- and is backed by
+    `test_finite_inputs_never_produce_non_finite_outputs`, which fails if any
+    kernel ever turns finite input into NaN. Without that test this would be
+    hiding evidence rather than filtering noise.
+    """
+
+    def apply_quietly(*blocks):
+        with np.errstate(invalid="ignore"):
+            return kernel(*blocks)
+
+    apply_quietly.__name__ = getattr(kernel, "__name__", "kernel")
+    return apply_quietly
+
+
 def _apply(kernel, *data_arrays):
     """Apply a `core` scalar kernel elementwise across dask-backed arrays."""
     return xr.apply_ufunc(
-        kernel, *data_arrays, dask="parallelized", output_dtypes=[np.float32]
+        _quiet_on_masked_nan(kernel),
+        *data_arrays,
+        dask="parallelized",
+        output_dtypes=[np.float32],
     )
 
 
