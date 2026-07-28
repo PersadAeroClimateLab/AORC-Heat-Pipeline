@@ -11,7 +11,7 @@ from aorc_heat import pipeline
 
 DEFAULT_START_YEAR = 1979
 DEFAULT_END_YEAR = 2024
-DASHBOARD_ADDRESS = ":8002"
+DEFAULT_DASHBOARD_ADDRESS = ":0"
 
 
 def _positive_integer(value):
@@ -105,6 +105,16 @@ def build_parser():
         default=DEFAULT_END_YEAR,
         help=f"Last year to compute, inclusive. Default {DEFAULT_END_YEAR}.",
     )
+    parser.add_argument(
+        "--dashboard-address",
+        default=DEFAULT_DASHBOARD_ADDRESS,
+        help=(
+            "Address the Dask dashboard binds to, for example ':8787'. Default "
+            f"'{DEFAULT_DASHBOARD_ADDRESS}' picks an ephemeral free port so that "
+            "concurrent runs on one node cannot collide; the chosen port is "
+            "printed at startup."
+        ),
+    )
 
     return parser
 
@@ -135,10 +145,12 @@ def main(argv=None):
         n_workers=arguments.cores,
         threads_per_worker=1,
         memory_limit=arguments.memory_limit,
-        dashboard_address=DASHBOARD_ADDRESS,
+        dashboard_address=arguments.dashboard_address,
+        host="127.0.0.1",
     )
     try:
         print(cluster.get_client())
+        print(f"Dask dashboard: {cluster.dashboard_link}")
         store_path = pipeline.run(
             output_dir=arguments.output_dir,
             metric_names=metric_names,

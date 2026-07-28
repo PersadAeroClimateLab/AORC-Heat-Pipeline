@@ -79,6 +79,18 @@ def test_positive_cores_is_accepted():
     assert arguments.cores == 8
 
 
+def test_dashboard_address_defaults_to_an_ephemeral_port():
+    arguments = cli.build_parser().parse_args(BASE_ARGUMENTS + ["--all"])
+    assert arguments.dashboard_address == cli.DEFAULT_DASHBOARD_ADDRESS == ":0"
+
+
+def test_dashboard_address_can_be_set_explicitly():
+    arguments = cli.build_parser().parse_args(
+        BASE_ARGUMENTS + ["--all", "--dashboard-address", ":8787"]
+    )
+    assert arguments.dashboard_address == ":8787"
+
+
 @pytest.mark.parametrize(
     "incomplete_arguments",
     [

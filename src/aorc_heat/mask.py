@@ -107,23 +107,66 @@ def _point_in_rings(longitude, latitude, vertices, ring_bounds, polygon_bounds):
 
 @nb.njit(parallel=True, cache=True)
 def _grid_in_polygon(latitudes, longitudes, polygon):
-    """Point-in-polygon over a full lat/lon grid."""
+    """Point-in-polygon over a full lat/lon grid.
+
+    A point outside the polygon's own bounding box cannot be inside the
+    polygon, so it is rejected without a ray-cast. The bounds are computed
+    once, outside both loops, since the whole point is to avoid doing this
+    work per grid point. Comparisons are strict (`<`/`>`) so a point exactly
+    on the bbox edge still falls through to the full ray-cast -- the
+    prefilter may only skip points it can prove are outside.
+    """
+    min_longitude = polygon[:, 0].min()
+    max_longitude = polygon[:, 0].max()
+    min_latitude = polygon[:, 1].min()
+    max_latitude = polygon[:, 1].max()
+
     result = np.empty((latitudes.size, longitudes.size), dtype=nb.boolean)
     for row in nb.prange(latitudes.size):
+        latitude = latitudes[row]
         for column in range(longitudes.size):
-            result[row, column] = point_in_polygon(longitudes[column], latitudes[row], polygon)
+            longitude = longitudes[column]
+            if (
+                longitude < min_longitude
+                or longitude > max_longitude
+                or latitude < min_latitude
+                or latitude > max_latitude
+            ):
+                result[row, column] = False
+            else:
+                result[row, column] = point_in_polygon(longitude, latitude, polygon)
     return result
 
 
 @nb.njit(parallel=True, cache=True)
 def _grid_in_rings(latitudes, longitudes, vertices, ring_bounds, polygon_bounds):
-    """Point-in-(multi-polygon-with-holes) over a full lat/lon grid."""
+    """Point-in-(multi-polygon-with-holes) over a full lat/lon grid.
+
+    Same bounding-box prefilter as `_grid_in_polygon`, computed once over all
+    vertices of every ring (exterior and holes alike) so a point outside the
+    union of every polygon's extent is rejected before any ray-cast.
+    """
+    min_longitude = vertices[:, 0].min()
+    max_longitude = vertices[:, 0].max()
+    min_latitude = vertices[:, 1].min()
+    max_latitude = vertices[:, 1].max()
+
     result = np.empty((latitudes.size, longitudes.size), dtype=nb.boolean)
     for row in nb.prange(latitudes.size):
+        latitude = latitudes[row]
         for column in range(longitudes.size):
-            result[row, column] = _point_in_rings(
-                longitudes[column], latitudes[row], vertices, ring_bounds, polygon_bounds
-            )
+            longitude = longitudes[column]
+            if (
+                longitude < min_longitude
+                or longitude > max_longitude
+                or latitude < min_latitude
+                or latitude > max_latitude
+            ):
+                result[row, column] = False
+            else:
+                result[row, column] = _point_in_rings(
+                    longitude, latitude, vertices, ring_bounds, polygon_bounds
+                )
     return result
 
 
