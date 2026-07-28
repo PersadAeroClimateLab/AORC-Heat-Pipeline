@@ -28,6 +28,32 @@ def test_point_in_polygon(longitude, latitude, inside):
     assert mask_module.point_in_polygon(longitude, latitude, UNIT_SQUARE) == inside
 
 
+@pytest.mark.skipif(
+    not mask_module.TEXAS_MASK_PATH.is_file() or not mask_module.TEXAS_SHAPEFILE_PATH.is_file(),
+    reason="cached mask or shapefile not present in this checkout",
+)
+def test_build_mask_from_shapefile_matches_cached_mask_on_a_grid_subset():
+    # build_mask now handles multiple features, MultiPolygon parts, and
+    # interior rings (holes) -- but this is a robustness fix, not a behaviour
+    # change: the bundled shapefile is (verified) 1 feature, 1 Polygon, 0
+    # interior rings, so today's correct answer must come out bit-identical.
+    # Point-in-polygon over the full 4201x8401 CONUS grid against ~90,405
+    # vertices is slow, so this checks every 20th lat/lon rather than the
+    # whole domain.
+    cached = xr.open_dataset(mask_module.TEXAS_MASK_PATH)["mask"].astype(bool)
+    subset_latitudes = cached.latitude.values[::20]
+    subset_longitudes = cached.longitude.values[::20]
+
+    rebuilt = mask_module.build_mask(
+        subset_latitudes, subset_longitudes, mask_module.TEXAS_SHAPEFILE_PATH
+    )
+    cached_subset = cached.isel(
+        latitude=slice(None, None, 20), longitude=slice(None, None, 20)
+    )
+
+    assert np.array_equal(rebuilt.values, cached_subset.values)
+
+
 def test_mask_from_polygon_has_grid_dimensions():
     latitudes = np.linspace(-1.0, 2.0, 13, dtype=np.float64)
     longitudes = np.linspace(-1.0, 2.0, 13, dtype=np.float64)

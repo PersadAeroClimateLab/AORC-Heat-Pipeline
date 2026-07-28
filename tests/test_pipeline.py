@@ -286,6 +286,61 @@ def test_daily_metrics_sets_variable_attributes(synthetic_aorc_dataset):
     assert result.attrs["source_version"] == "AORC Version 1.1"
 
 
+def test_heat_index_and_relative_humidity_clamp_supersaturated_air():
+    # core.relative_humidity routinely exceeds 100% from float noise in
+    # saturated air (see test_wet_bulb_temperature_supersaturated_equals_air_temperature
+    # in test_core.py), and heat_index's regression is only defined over
+    # 0-100% RH: at T=95 F an unclamped RH=110 swings heat_index ~16 F versus
+    # RH=100. Build a dataset supersaturated to exactly RH=110% before
+    # clamping, and check both that relative_humidity itself reads back
+    # clamped to 100 (not 110), and that heat_index -- fed the same clamped
+    # intermediate -- matches heat_index evaluated at exactly RH=100%.
+    air_temperature_celsius = np.float32(35.0)
+    air_temperature_kelvin = air_temperature_celsius + np.float32(273.15)
+    air_pressure_hpa = np.float32(1000.0)
+
+    saturation = core.saturation_vapor_pressure(air_temperature_celsius)
+    supersaturated_vapor_pressure = saturation * np.float32(1.10)
+    epsilon = core.DRY_AIR_TO_VAPOR_MOLAR_MASS_RATIO
+    specific_humidity = (epsilon * supersaturated_vapor_pressure) / (
+        air_pressure_hpa - (np.float32(1.0) - epsilon) * supersaturated_vapor_pressure
+    )
+
+    hours = 24
+    times = xr.date_range(
+        "2000-07-01", periods=hours, freq="h", use_cftime=True, calendar="standard"
+    )
+    shape = (hours, 1, 1)
+    dataset = xr.Dataset(
+        {
+            "TMP_2maboveground": (
+                ("time", "latitude", "longitude"),
+                np.full(shape, air_temperature_kelvin, dtype=np.float32),
+            ),
+            "SPFH_2maboveground": (
+                ("time", "latitude", "longitude"),
+                np.full(shape, specific_humidity, dtype=np.float32),
+            ),
+            "PRES_surface": (
+                ("time", "latitude", "longitude"),
+                np.full(shape, air_pressure_hpa * np.float32(100.0), dtype=np.float32),
+            ),
+        },
+        coords={"time": times, "latitude": [30.0], "longitude": [-99.0]},
+    ).chunk({"time": 24})
+
+    result = pipeline.daily_metrics(dataset, ["heat_index", "relative_humidity"]).compute()
+
+    assert float(result["relative_humidity_mean"].item()) == pytest.approx(100.0, abs=0.1)
+
+    expected_heat_index = core.heat_index(
+        core.celsius_to_fahrenheit(air_temperature_celsius), np.float32(100.0)
+    )
+    assert float(result["heat_index_mean"].item()) == pytest.approx(
+        float(expected_heat_index), rel=1e-4
+    )
+
+
 def test_prepare_dataset_crops_and_masks(synthetic_aorc_dataset):
     from aorc_heat.mask import Region
 

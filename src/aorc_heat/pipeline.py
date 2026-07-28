@@ -110,7 +110,7 @@ def _variable_attributes(metric_name, statistic):
     return {
         "units": METRICS[metric_name].units,
         "source_timestep": "hourly",
-        "description": f"Daily {statistic} of hourly {readable} taken across 24 hours",
+        "description": f"Daily {statistic} of hourly {readable} taken across 24 UTC hours",
     }
 
 
@@ -149,9 +149,14 @@ def _derived_inputs(aorc_dataset, metric_names):
 
     if "heat_index" in metric_names or "relative_humidity" in metric_names:
         saturation = _apply(core.saturation_vapor_pressure, derived["air_temperature_celsius"])
+        # Clamped to [0, 100] here, once, so both consumers -- heat_index (whose
+        # regression is only defined over that range; a supersaturated cell can
+        # otherwise swing the result tens of degrees) and the exported
+        # relative_humidity metric -- see the same value. Float noise in
+        # saturated air routinely pushes the raw ratio a little past 100.
         derived["relative_humidity_percent"] = _apply(
             core.relative_humidity, derived["vapor_pressure_hpa"], saturation
-        )
+        ).clip(0, 100)
 
     if "apparent_temperature" in metric_names:
         derived["wind_speed_ms"] = np.sqrt(

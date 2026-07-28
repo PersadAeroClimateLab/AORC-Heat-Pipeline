@@ -79,7 +79,7 @@ def test_kelvin_to_celsius(kelvin, celsius):
         (0.0, 6.11, 0.01),    # triple-point reference
         (20.0, 23.39, 0.05),  # standard psychrometric table value
         (30.0, 42.43, 0.05),
-        (-10.0, 2.60, 0.05),  # over-ice branch (T <= 0)
+        (-10.0, 2.857, 0.05),  # over-water Tetens, applied at all temperatures
     ],
 )
 def test_saturation_vapor_pressure(air_temperature_celsius, expected_hpa, tolerance):
@@ -95,7 +95,15 @@ def test_saturation_vapor_pressure_increases_with_temperature():
 
 @pytest.mark.parametrize("air_temperature_celsius", [-15.0, -5.0, 5.0, 25.0])
 def test_saturation_vapor_pressure_slope_matches_finite_difference(air_temperature_celsius):
-    delta = 1e-3
+    # delta=1e-3 was too small: es(T+delta) and es(T-delta) are both ~O(1) hPa
+    # while their difference is ~O(1e-4), so subtracting two float32 values
+    # this close loses precision to cancellation, not to the finite-difference
+    # approximation itself. delta=1e-2 keeps the truncation error negligible
+    # for this smooth a function while giving the subtraction enough headroom
+    # that float32 rounding no longer dominates (checked empirically: relative
+    # error at delta=1e-2 is <=0.02% at every sampled temperature here, vs the
+    # 0.15% tolerance below).
+    delta = 1e-2
     analytic = core.saturation_vapor_pressure_slope(air_temperature_celsius)
     numeric = (
         core.saturation_vapor_pressure(air_temperature_celsius + delta)
@@ -140,6 +148,18 @@ def test_relative_humidity_saturated_air_is_100_percent():
 def test_relative_humidity_half_saturated():
     saturation = core.saturation_vapor_pressure(25.0)
     assert core.relative_humidity(0.5 * saturation, saturation) == pytest.approx(50.0, rel=1e-5)
+
+
+def test_relative_humidity_saturated_air_is_100_percent_below_freezing():
+    # saturation_vapor_pressure uses the over-water Tetens coefficients at all
+    # temperatures now (the WMO/station convention), including below 0 C. Air
+    # saturated with respect to water at -10 C must still read 100% RH -- this
+    # is a physical invariant of `relative_humidity`, independent of which
+    # coefficients `saturation_vapor_pressure` happens to use, so it also
+    # guards against the over-ice branch (removed in this change) silently
+    # coming back.
+    saturation = core.saturation_vapor_pressure(-10.0)
+    assert core.relative_humidity(saturation, saturation) == pytest.approx(100.0, rel=1e-5)
 
 
 # ---------------------------------------------------------------------------
@@ -192,6 +212,19 @@ def test_heat_index_uses_simple_formula_below_threshold():
     assert expected < 80.0
     result = core.heat_index(air_temperature_fahrenheit, relative_humidity_percent)
     assert result == pytest.approx(expected, rel=1e-5)
+
+
+def test_heat_index_switches_on_average_with_temperature_not_on_simple_form_alone():
+    # NWS spec: compute the simple Steadman form, average it WITH THE
+    # TEMPERATURE, and only switch to the full regression if that average is
+    # >= 80 F -- not if the simple form alone exceeds 80.
+    #
+    # At T=79 F / RH=93%: simple form = 0.5*(79+61+11*1.2+93*0.094) = 80.971,
+    # which alone is > 80 (the old, wrong condition). But averaged with T=79,
+    # (80.971 + 79) / 2 = 79.986, which is < 80 -- so the correct behaviour is
+    # to return the simple form itself, ~80.97 F. The old code instead entered
+    # the full regression here and returned ~83.22 F, a 2.25 F error.
+    assert core.heat_index(79.0, 93.0) == pytest.approx(80.97, abs=0.1)
 
 
 # ---------------------------------------------------------------------------

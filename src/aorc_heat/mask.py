@@ -74,6 +74,37 @@ def point_in_polygon(longitude, latitude, polygon):
     return inside
 
 
+@nb.njit(cache=True)
+def _point_in_rings(longitude, latitude, vertices, ring_bounds, polygon_bounds):
+    """Ray-casting test against one or more polygons, each possibly with holes.
+
+    Within a polygon, the ray-casting parity from each of its rings (the
+    exterior plus any interior/hole rings) is XORed together: ray-casting
+    parity composes, so being inside the exterior but inside an odd number of
+    holes cancels out to exactly "inside the exterior and not inside a hole".
+    Across polygons the per-polygon results are OR-ed, since a point belongs
+    to a MultiPolygon -- or to multiple shapefile features -- if it lies
+    inside ANY one of its parts.
+
+    :param longitude: Point longitude in degrees east
+    :param latitude: Point latitude in degrees north
+    :param vertices: (V, 2) array of all ring vertices concatenated
+    :param ring_bounds: (R+1,) offsets into `vertices` bounding each ring
+    :param polygon_bounds: (P+1,) offsets into `ring_bounds` bounding each
+        polygon's rings
+    :return: True when the point lies inside the geometry
+    """
+    for polygon_index in range(len(polygon_bounds) - 1):
+        inside_polygon = False
+        for ring_index in range(polygon_bounds[polygon_index], polygon_bounds[polygon_index + 1]):
+            ring = vertices[ring_bounds[ring_index] : ring_bounds[ring_index + 1]]
+            if point_in_polygon(longitude, latitude, ring):
+                inside_polygon = not inside_polygon
+        if inside_polygon:
+            return True
+    return False
+
+
 @nb.njit(parallel=True, cache=True)
 def _grid_in_polygon(latitudes, longitudes, polygon):
     """Point-in-polygon over a full lat/lon grid."""
@@ -84,8 +115,34 @@ def _grid_in_polygon(latitudes, longitudes, polygon):
     return result
 
 
+@nb.njit(parallel=True, cache=True)
+def _grid_in_rings(latitudes, longitudes, vertices, ring_bounds, polygon_bounds):
+    """Point-in-(multi-polygon-with-holes) over a full lat/lon grid."""
+    result = np.empty((latitudes.size, longitudes.size), dtype=nb.boolean)
+    for row in nb.prange(latitudes.size):
+        for column in range(longitudes.size):
+            result[row, column] = _point_in_rings(
+                longitudes[column], latitudes[row], vertices, ring_bounds, polygon_bounds
+            )
+    return result
+
+
+def _wrap_mask(values, latitudes, longitudes):
+    """Package a boolean grid as the mask DataArray both builders return."""
+    return xr.DataArray(
+        values,
+        dims=("latitude", "longitude"),
+        coords={"latitude": latitudes, "longitude": longitudes},
+        name="mask",
+        attrs=MASK_ATTRIBUTES,
+    )
+
+
 def mask_from_polygon(latitudes, longitudes, polygon):
-    """Build a boolean mask over a lat/lon grid from polygon vertices.
+    """Build a boolean mask over a lat/lon grid from a single polygon ring.
+
+    For a general geometry that may have multiple parts or holes, use
+    `mask_from_rings` instead.
 
     :param latitudes: 1-D array of latitudes in degrees north
     :param longitudes: 1-D array of longitudes in degrees east
@@ -97,21 +154,45 @@ def mask_from_polygon(latitudes, longitudes, polygon):
         np.ascontiguousarray(longitudes, dtype=np.float64),
         np.ascontiguousarray(polygon, dtype=np.float64),
     )
-    return xr.DataArray(
-        values,
-        dims=("latitude", "longitude"),
-        coords={"latitude": latitudes, "longitude": longitudes},
-        name="mask",
-        attrs=MASK_ATTRIBUTES,
+    return _wrap_mask(values, latitudes, longitudes)
+
+
+def mask_from_rings(latitudes, longitudes, vertices, ring_bounds, polygon_bounds):
+    """Build a boolean mask over a lat/lon grid from multiple polygons with holes.
+
+    :param latitudes: 1-D array of latitudes in degrees north
+    :param longitudes: 1-D array of longitudes in degrees east
+    :param vertices: (V, 2) array of all ring vertices concatenated, as
+        (longitude, latitude) pairs
+    :param ring_bounds: (R+1,) offsets into `vertices` bounding each ring;
+        ring i is `vertices[ring_bounds[i]:ring_bounds[i + 1]]`
+    :param polygon_bounds: (P+1,) offsets into `ring_bounds` bounding each
+        polygon's rings; polygon j's rings are
+        `range(polygon_bounds[j], polygon_bounds[j + 1])`. A polygon's first
+        ring is its exterior; any further rings are holes.
+    :return: Boolean DataArray over dims ("latitude", "longitude")
+    """
+    values = _grid_in_rings(
+        np.ascontiguousarray(latitudes, dtype=np.float64),
+        np.ascontiguousarray(longitudes, dtype=np.float64),
+        np.ascontiguousarray(vertices, dtype=np.float64),
+        np.ascontiguousarray(ring_bounds, dtype=np.int64),
+        np.ascontiguousarray(polygon_bounds, dtype=np.int64),
     )
+    return _wrap_mask(values, latitudes, longitudes)
 
 
 def build_mask(latitudes, longitudes, shapefile_path):
     """Build a boundary mask by reading a shapefile.
 
+    Every feature in the shapefile contributes, each feature's geometry may be
+    a Polygon or a MultiPolygon, and each polygon's interior rings (holes) are
+    subtracted rather than filled in. A point is inside the mask if it is
+    inside any polygon's exterior and not inside that polygon's holes.
+
     :param latitudes: 1-D array of latitudes in degrees north
     :param longitudes: 1-D array of longitudes in degrees east
-    :param shapefile_path: Path to a shapefile whose first geometry is the boundary
+    :param shapefile_path: Path to a shapefile describing the boundary
     :return: Boolean DataArray over dims ("latitude", "longitude")
     """
     import geopandas
@@ -121,8 +202,27 @@ def build_mask(latitudes, longitudes, shapefile_path):
         raise FileNotFoundError(f"Boundary shapefile not found at {shapefile_path}")
 
     boundary = geopandas.read_file(shapefile_path).to_crs(crs=4326)
-    polygon = np.array(boundary.geometry[0].exterior.coords.xy).T
-    return mask_from_polygon(latitudes, longitudes, polygon)
+
+    vertex_arrays = []
+    ring_bounds = [0]
+    polygon_bounds = [0]
+    for geometry in boundary.geometry:
+        polygons = geometry.geoms if geometry.geom_type == "MultiPolygon" else (geometry,)
+        for polygon in polygons:
+            for ring in (polygon.exterior, *polygon.interiors):
+                ring_vertices = np.array(ring.coords.xy).T
+                vertex_arrays.append(ring_vertices)
+                ring_bounds.append(ring_bounds[-1] + len(ring_vertices))
+            polygon_bounds.append(len(ring_bounds) - 1)
+
+    vertices = np.concatenate(vertex_arrays, axis=0)
+    return mask_from_rings(
+        latitudes,
+        longitudes,
+        vertices,
+        np.array(ring_bounds, dtype=np.int64),
+        np.array(polygon_bounds, dtype=np.int64),
+    )
 
 
 def _snap_outward(start, stop, alignment, limit):

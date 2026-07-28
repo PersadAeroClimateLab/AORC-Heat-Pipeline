@@ -30,12 +30,13 @@ KELVIN_TO_CELSIUS_OFFSET = np.float32(273.15)
 #: Ratio of the molar masses of water vapour and dry air, dimensionless.
 DRY_AIR_TO_VAPOR_MOLAR_MASS_RATIO = np.float32(0.622)
 
-# Tetens (1930) coefficients: over water above 0 C, over ice at or below 0 C.
+# Tetens (1930) over-water coefficients, applied at all temperatures. RH is
+# conventionally reported with respect to liquid water even below 0 C (the WMO
+# and station-observation convention), so the over-ice branch that used to
+# apply at or below 0 C has been removed.
 TETENS_REFERENCE_PRESSURE_HPA = np.float32(6.1078)
 TETENS_WATER_NUMERATOR = np.float32(17.27)
 TETENS_WATER_DENOMINATOR = np.float32(237.3)
-TETENS_ICE_NUMERATOR = np.float32(21.875)
-TETENS_ICE_DENOMINATOR = np.float32(265.5)
 
 
 @nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
@@ -77,24 +78,21 @@ def kelvin_to_celsius(air_temperature_kelvin: float) -> float:
 def saturation_vapor_pressure(air_temperature_celsius: float) -> float:
     """Saturation vapour pressure from the Tetens equation.
 
-    Uses the over-water coefficients above 0 C and the over-ice coefficients at
-    or below it. https://en.wikipedia.org/wiki/Tetens_equation
+    Uses the over-water coefficients at all temperatures, per the WMO/station
+    convention of reporting relative humidity with respect to liquid water even
+    below 0 C. https://en.wikipedia.org/wiki/Tetens_equation
 
     :param air_temperature_celsius: Temperature in degrees Celsius
     :return: Saturation vapour pressure in hPa
     """
     temperature = np.float32(air_temperature_celsius)
-    # Masked cells arrive as NaN. Both branches below would return NaN anyway,
+    # Masked cells arrive as NaN. The expression below would return NaN anyway,
     # but reaching the ordered comparison with a NaN operand raises the IEEE-754
     # invalid-operation flag, which surfaces as a RuntimeWarning per chunk.
     if temperature != temperature:
         return np.float32(np.nan)
-    if temperature > np.float32(0.0):
-        return TETENS_REFERENCE_PRESSURE_HPA * np.exp(
-            TETENS_WATER_NUMERATOR * temperature / (temperature + TETENS_WATER_DENOMINATOR)
-        )
     return TETENS_REFERENCE_PRESSURE_HPA * np.exp(
-        TETENS_ICE_NUMERATOR * temperature / (temperature + TETENS_ICE_DENOMINATOR)
+        TETENS_WATER_NUMERATOR * temperature / (temperature + TETENS_WATER_DENOMINATOR)
     )
 
 
@@ -114,23 +112,13 @@ def saturation_vapor_pressure_slope(air_temperature_celsius: float) -> float:
     # against a NaN operand raising the invalid-operation flag.
     if temperature != temperature:
         return np.float32(np.nan)
-    if temperature > np.float32(0.0):
-        denominator = temperature + TETENS_WATER_DENOMINATOR
-        saturation = TETENS_REFERENCE_PRESSURE_HPA * np.exp(
-            TETENS_WATER_NUMERATOR * temperature / denominator
-        )
-        return (
-            saturation
-            * (TETENS_WATER_NUMERATOR * TETENS_WATER_DENOMINATOR)
-            / (denominator * denominator)
-        )
-    denominator = temperature + TETENS_ICE_DENOMINATOR
+    denominator = temperature + TETENS_WATER_DENOMINATOR
     saturation = TETENS_REFERENCE_PRESSURE_HPA * np.exp(
-        TETENS_ICE_NUMERATOR * temperature / denominator
+        TETENS_WATER_NUMERATOR * temperature / denominator
     )
     return (
         saturation
-        * (TETENS_ICE_NUMERATOR * TETENS_ICE_DENOMINATOR)
+        * (TETENS_WATER_NUMERATOR * TETENS_WATER_DENOMINATOR)
         / (denominator * denominator)
     )
 
@@ -193,7 +181,7 @@ def heat_index(air_temperature_fahrenheit: float, relative_humidity_percent: flo
         + (humidity * np.float32(0.094))
     )
 
-    if index > np.float32(80.0):
+    if (index + temperature) * np.float32(0.5) >= np.float32(80.0):
         temperature_squared = temperature * temperature
         humidity_squared = humidity * humidity
         cross_term = temperature * humidity
