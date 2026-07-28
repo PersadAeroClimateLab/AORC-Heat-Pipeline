@@ -15,10 +15,12 @@ ALL_METRICS = [
     "humidex",
     "simplified_wbgt",
     "wet_bulb_temperature",
+    "temperature",
+    "relative_humidity",
 ]
 
 
-def test_registry_covers_the_five_in_scope_metrics():
+def test_registry_covers_every_in_scope_metric():
     assert sorted(pipeline.METRICS) == sorted(ALL_METRICS)
 
 
@@ -32,12 +34,21 @@ def test_required_variables_only_reads_wind_for_apparent_temperature():
     assert pipeline.NORTHWARD_WIND in with_wind
 
 
-def test_required_variables_always_reads_temperature_humidity_pressure():
+def test_required_variables_always_reads_air_temperature():
+    for name in ALL_METRICS:
+        assert pipeline.AIR_TEMPERATURE in pipeline.required_variables([name])
+
+
+def test_required_variables_reads_humidity_and_pressure_except_for_temperature():
+    # Every metric except `temperature` derives vapour pressure, which needs
+    # both specific humidity and surface pressure. `temperature` needs neither.
     for name in ALL_METRICS:
         variables = pipeline.required_variables([name])
-        assert pipeline.AIR_TEMPERATURE in variables
-        assert pipeline.SPECIFIC_HUMIDITY in variables
-        assert pipeline.SURFACE_PRESSURE in variables
+        if name == "temperature":
+            assert variables == [pipeline.AIR_TEMPERATURE]
+        else:
+            assert pipeline.SPECIFIC_HUMIDITY in variables
+            assert pipeline.SURFACE_PRESSURE in variables
 
 
 def test_required_variables_rejects_unknown_metric():
@@ -138,6 +149,61 @@ def test_daily_metrics_apparent_temperature_matches_manual_numpy(synthetic_aorc_
         np.testing.assert_allclose(
             result["apparent_temperature_max"].isel(time=day).values, window.max(axis=0), rtol=1e-5
         )
+
+
+def test_daily_metrics_temperature_matches_manual_numpy(synthetic_aorc_dataset):
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["temperature"]).compute()
+
+    loaded = synthetic_aorc_dataset.compute()
+    # Kelvin -> Celsius -> Fahrenheit, exactly once. A missing or doubled
+    # conversion changes the numbers here.
+    hourly = core.celsius_to_fahrenheit(core.kelvin_to_celsius(loaded["TMP_2maboveground"].values))
+
+    for day in (0, 1):
+        window = hourly[day * 24 : (day + 1) * 24]
+        np.testing.assert_allclose(
+            result["temperature_min"].isel(time=day).values, window.min(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["temperature_mean"].isel(time=day).values, window.mean(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["temperature_max"].isel(time=day).values, window.max(axis=0), rtol=1e-5
+        )
+
+
+def test_daily_metrics_relative_humidity_matches_manual_numpy(synthetic_aorc_dataset):
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["relative_humidity"]).compute()
+
+    loaded = synthetic_aorc_dataset.compute()
+    air_temperature_celsius = core.kelvin_to_celsius(loaded["TMP_2maboveground"].values)
+    air_pressure_hpa = (loaded["PRES_surface"].values / 100.0).astype(np.float32)
+    vapor = core.vapor_pressure(loaded["SPFH_2maboveground"].values, air_pressure_hpa)
+    saturation = core.saturation_vapor_pressure(air_temperature_celsius)
+    # Output is a percent, carried through with no Fahrenheit conversion.
+    hourly = core.relative_humidity(vapor, saturation)
+
+    for day in (0, 1):
+        window = hourly[day * 24 : (day + 1) * 24]
+        np.testing.assert_allclose(
+            result["relative_humidity_min"].isel(time=day).values, window.min(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["relative_humidity_mean"].isel(time=day).values, window.mean(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["relative_humidity_max"].isel(time=day).values, window.max(axis=0), rtol=1e-5
+        )
+
+
+def test_relative_humidity_is_a_percent_not_fahrenheit(synthetic_aorc_dataset):
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["relative_humidity"])
+    assert result["relative_humidity_mean"].attrs["units"] == "percent"
+
+
+def test_temperature_is_fahrenheit(synthetic_aorc_dataset):
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["temperature"])
+    assert result["temperature_mean"].attrs["units"] == "deg_F"
 
 
 def test_daily_metrics_orders_statistics_min_le_mean_le_max(synthetic_aorc_dataset):

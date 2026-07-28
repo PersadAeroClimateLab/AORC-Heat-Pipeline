@@ -1,0 +1,6 @@
+<Client: 'tcp://127.0.0.1:21837' processes=20 threads=20, memory=558.79 GiB>
+1784829731.775409 [init] Computing apparent_temperature, heat_index, humidex, simplified_wbgt, wet_bulb_temperature for 1979-2024.
+1784829733.34221 [init] Loading the Texas mask.
+1784829733.457368 [init] Native spatial chunks (128, 256); region cropped to latitude[640:2048] longitude[2560:4608].
+1784829739.926306 [init] Allocated 15 variables in /local1/AORC-Heat-Pipeline/output_zarrs/aorc_heat_metrics.zarr.
+1784829739.926395 [compute] Deriving metrics for 1979.

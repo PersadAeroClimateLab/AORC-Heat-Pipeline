@@ -15,7 +15,7 @@ import numpy as np
 
 #: Fast-math flags for kernels that branch on a value which may be NaN.
 #:
-#: `fastmath=True` includes `nnan`, which tells LLVM to assume no operand is
+#: `fastmath=NAN_SAFE_FASTMATH` includes `nnan`, which tells LLVM to assume no operand is
 #: ever NaN. Under that assumption a `x != x` guard is dead code and gets
 #: folded away, and an if/elif chain may be treated as exhaustive. Both
 #: matter here: the pipeline masks to a region with `.where`, so most cells
@@ -38,7 +38,7 @@ TETENS_ICE_NUMERATOR = np.float32(21.875)
 TETENS_ICE_DENOMINATOR = np.float32(265.5)
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def celsius_to_fahrenheit(air_temperature_celsius: float) -> float:
     """Convert a temperature to degrees Fahrenheit.
 
@@ -51,7 +51,7 @@ def celsius_to_fahrenheit(air_temperature_celsius: float) -> float:
     )
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def fahrenheit_to_celsius(air_temperature_fahrenheit: float) -> float:
     """Convert a temperature to degrees Celsius.
 
@@ -63,7 +63,7 @@ def fahrenheit_to_celsius(air_temperature_fahrenheit: float) -> float:
     ) / CELSIUS_TO_FAHRENHEIT_SCALE
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def kelvin_to_celsius(air_temperature_kelvin: float) -> float:
     """Convert a temperature to degrees Celsius.
 
@@ -135,7 +135,7 @@ def saturation_vapor_pressure_slope(air_temperature_celsius: float) -> float:
     )
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def vapor_pressure(specific_humidity: float, air_pressure_hpa: float) -> float:
     """Vapour pressure from specific humidity and ambient pressure.
 
@@ -151,7 +151,7 @@ def vapor_pressure(specific_humidity: float, air_pressure_hpa: float) -> float:
     return humidity * pressure / (epsilon + (np.float32(1.0) - epsilon) * humidity)
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def relative_humidity(vapor_pressure_hpa: float, saturation_vapor_pressure_hpa: float) -> float:
     """Relative humidity as a percentage of saturation.
 
@@ -221,7 +221,7 @@ def heat_index(air_temperature_fahrenheit: float, relative_humidity_percent: flo
     return index
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def apparent_temperature(
     air_temperature_celsius: float, vapor_pressure_hpa: float, wind_speed_ms: float
 ) -> float:
@@ -242,7 +242,7 @@ def apparent_temperature(
     )
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def humidex(air_temperature_celsius: float, vapor_pressure_hpa: float) -> float:
     """Canadian humidex.
 
@@ -257,7 +257,7 @@ def humidex(air_temperature_celsius: float, vapor_pressure_hpa: float) -> float:
     )
 
 
-@nb.vectorize(target="cpu", cache=True, fastmath=True)
+@nb.vectorize(target="cpu", cache=True, fastmath=NAN_SAFE_FASTMATH)
 def simplified_wbgt(air_temperature_celsius: float, vapor_pressure_hpa: float) -> float:
     """ACSM simplified wet-bulb globe temperature.
 
@@ -288,7 +288,7 @@ LATENT_HEAT_SLOPE = np.float32(-2370.0)       # J/kg per degree Celsius
 
 
 #: Fast-math flags for `wet_bulb_temperature`, deliberately omitting `nnan` and
-#: `ninf`. With plain `fastmath=True` (which sets `nnan`), LLVM is permitted to
+#: `ninf`. With plain `fastmath=NAN_SAFE_FASTMATH` (which sets `nnan`), LLVM is permitted to
 #: assume no operand is ever NaN; that license lets it collapse the branch that
 #: clamps the iterate against the depression bound so that a NaN iterate takes
 #: the "clamp to bound" arm unconditionally, silently replacing NaN with a
@@ -331,7 +331,7 @@ def wet_bulb_temperature(
     # correct answer and far cheaper.
     #
     # This check is only reliable because NAN_SAFE_FASTMATH omits `nnan`.
-    # Under `fastmath=True` LLVM assumes no operand is ever NaN and is free to
+    # Under `fastmath=NAN_SAFE_FASTMATH` LLVM assumes no operand is ever NaN and is free to
     # fold the comparison away.
     if (
         temperature != temperature

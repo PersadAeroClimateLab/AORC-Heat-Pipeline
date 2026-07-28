@@ -98,10 +98,14 @@ def _apply(kernel, *data_arrays):
 
 
 def _variable_attributes(metric_name, statistic):
-    """CF-style attributes for one output variable."""
+    """CF-style attributes for one output variable.
+
+    Units come from the metric's registry entry: most metrics are degrees
+    Fahrenheit, but `relative_humidity` is a percent.
+    """
     readable = metric_name.replace("_", " ")
     return {
-        "units": "deg_F",
+        "units": METRICS[metric_name].units,
         "source_timestep": "hourly",
         "description": f"Daily {statistic} of hourly {readable} taken across 24 hours",
     }
@@ -113,10 +117,10 @@ def _variable_attributes(metric_name, statistic):
 def _derived_inputs(aorc_dataset, metric_names):
     """Build the intermediate quantities the requested metrics need.
 
-    Each quantity is built once and handed to every metric that uses it. The
-    first four are unconditional because all five metrics depend on temperature,
-    humidity, and pressure; relative humidity and wind speed are built only when
-    the metric that needs them was requested.
+    Each quantity is built once and handed to every metric that uses it. Air
+    temperature, pressure, humidity, and vapour pressure are unconditional
+    because most metrics depend on them; relative humidity and wind speed are
+    built only when a metric that needs them was requested.
 
     :param aorc_dataset: Dataset holding raw AORC variables
     :param metric_names: Names of the metrics that will be computed
@@ -133,7 +137,7 @@ def _derived_inputs(aorc_dataset, metric_names):
         "vapor_pressure_hpa": _apply(core.vapor_pressure, specific_humidity, air_pressure_hpa),
     }
 
-    if "heat_index" in metric_names:
+    if "heat_index" in metric_names or "relative_humidity" in metric_names:
         saturation = _apply(core.saturation_vapor_pressure, air_temperature_celsius)
         derived["relative_humidity_percent"] = _apply(
             core.relative_humidity, derived["vapor_pressure_hpa"], saturation
@@ -200,21 +204,45 @@ def _wet_bulb_temperature(derived):
     )
 
 
+def _temperature(derived):
+    """Dry-bulb air temperature in degrees Fahrenheit.
+
+    Not a heat-stress index -- just the raw AORC temperature carried through
+    the same daily reduction, converted Kelvin -> Celsius -> Fahrenheit.
+    """
+    return _apply(core.celsius_to_fahrenheit, derived["air_temperature_celsius"])
+
+
+def _relative_humidity(derived):
+    """Relative humidity as a percentage.
+
+    Already built as a shared intermediate (heat index needs it too) and
+    already a percent, so this is a passthrough with no further conversion --
+    unlike every other metric, its output is not degrees Fahrenheit.
+    """
+    return derived["relative_humidity_percent"]
+
+
 @dataclass(frozen=True)
 class MetricSpec:
     """How to compute one metric and what raw AORC variables it needs.
 
     :param inputs: Raw AORC variable names that must be read
-    :param compute: Callable taking the derived-inputs mapping, returning hourly degrees F
+    :param compute: Callable taking the derived-inputs mapping, returning the
+        hourly metric value in the units named below
+    :param units: Output units for the CF `units` attribute; defaults to the
+        degrees Fahrenheit that every heat-stress metric produces
     """
 
     inputs: tuple
     compute: Callable
+    units: str = "deg_F"
 
 
-#: Every metric needs surface pressure, because `core.vapor_pressure` takes the
-#: ambient pressure rather than assuming a fixed 1013.25 hPa. Wind is the only
-#: variable a metric selection can avoid reading.
+#: Most metrics need surface pressure, because `core.vapor_pressure` takes the
+#: ambient pressure rather than assuming a fixed 1013.25 hPa. `temperature` is
+#: the exception -- it needs only air temperature. Wind is read only by
+#: `apparent_temperature`.
 METRICS = {
     "heat_index": MetricSpec(
         inputs=(AIR_TEMPERATURE, SPECIFIC_HUMIDITY, SURFACE_PRESSURE),
@@ -241,6 +269,15 @@ METRICS = {
     "wet_bulb_temperature": MetricSpec(
         inputs=(AIR_TEMPERATURE, SPECIFIC_HUMIDITY, SURFACE_PRESSURE),
         compute=_wet_bulb_temperature,
+    ),
+    "temperature": MetricSpec(
+        inputs=(AIR_TEMPERATURE,),
+        compute=_temperature,
+    ),
+    "relative_humidity": MetricSpec(
+        inputs=(AIR_TEMPERATURE, SPECIFIC_HUMIDITY, SURFACE_PRESSURE),
+        compute=_relative_humidity,
+        units="percent",
     ),
 }
 
