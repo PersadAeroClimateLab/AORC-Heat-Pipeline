@@ -555,9 +555,30 @@ def daily_metrics(aorc_dataset, metric_names):
 
 OUTPUT_STORE_NAME = "aorc_heat_metrics.zarr"
 
-#: Output time chunk, in days, giving ~48 MB chunks alongside the native
-#: (128, 256) spatial chunking. Sized for reading long time series at a point,
-#: the dominant access pattern for trend work.
+#: Output time chunk, in days. Alongside the native (128, 256) spatial chunking
+#: this gives 365 * 128 * 256 * 4 B = ~48 MB chunks.
+#:
+#: The spatial half of that shape is inherited, not chosen: the region crop is
+#: snapped to the source store's chunk grid so that no rechunk is needed on
+#: either read or write (see the module docstring), and the output store is
+#: allocated to match. The time chunk is then what makes the resulting chunk a
+#: reasonable size rather than a tiny one.
+#:
+#: **This is a spatially-oriented layout, and reading a long time series at a
+#: single point is expensive under it.** One chunk holds a year for a whole
+#: 128x256 tile, so a 46-year record at one grid cell means decompressing 47
+#: chunks -- about 2.2 GB -- to extract 67 kB, and 48 MB is itself above the
+#: 1-16 MB zarr generally wants. An earlier version of this comment claimed the
+#: opposite, that the shape was "sized for reading long time series at a point";
+#: it was not, and it never has been. Reading whole-domain maps, which is what
+#: the layout genuinely suits, costs the same ~2.4 GB for every cell of a day
+#: rather than for one.
+#:
+#: Improving point extraction means either splitting the output spatially
+#: (365 x 32 x 64 gives 3 MB chunks and cuts a point series to ~140 MB, at no
+#: cost to map reads, and still writes incrementally) or building a separate
+#: store chunked along time in a post-pass. Both were considered and
+#: deliberately not done; the layout is left as-is.
 #:
 #: This cannot divide the year boundaries: years alternate 365 and 366 days, so
 #: no fixed chunk size lines up with every year's start. Each yearly write
