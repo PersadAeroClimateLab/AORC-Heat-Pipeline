@@ -188,10 +188,18 @@ Each raw variable is read from the zarr store exactly once per year and reused
 across every metric that needs it; dask's blockwise fusion keeps the shared
 intermediates from being materialized more than once.
 
-The 24-hour time chunking means each daily resample group falls entirely within
-one chunk, so the reduction is chunk-local. AORC's native time chunk is 144
-hours — exactly six days — so this is a clean subdivision that keeps chunk
-boundaries day-aligned.
+Time chunking is left at AORC's native 144 hours. (An earlier version rechunked
+to 24 hours here; see the revision note below.) A daily resample group still
+falls entirely within one chunk — 144 hours is exactly six midnight-aligned days
+— so the reduction is chunk-local without any rechunk.
+
+**Revised after implementation.** Rechunking the input to 24 hours was found to
+inflate the per-year task graph roughly sixfold (measured: ~1.40M tasks versus
+~242k) for bit-identical daily output, because it split each native 144-hour
+chunk into six and the reduction immediately regrouped them. Since a native
+144-hour chunk already holds six whole days and AORC year files begin at
+midnight on 1 January, every daily group is already chunk-local. The rechunk was
+removed; `prepare_dataset` now leaves time at the native chunking.
 
 ### Chunk alignment (revised after implementation)
 

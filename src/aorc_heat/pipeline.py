@@ -6,9 +6,13 @@ pressure, and so on -- are shared by every metric that needs them, so the four
 metrics that depend on vapour pressure resolve to a single node in the dask
 graph rather than four.
 
-Input is rechunked to 24 hours per chunk so each daily reduction group lives
-entirely inside one chunk. AORC's native time chunk is 144 hours -- exactly six
-days -- so this is a clean subdivision that keeps chunk boundaries day-aligned.
+Time chunking is left at AORC's native 144 hours. That is exactly six days, and
+year files start at midnight on 1 January, so every native chunk boundary falls
+on a midnight and each chunk holds six whole days. A daily `resample` group
+therefore never crosses a chunk boundary -- the property the reduction needs --
+without any rechunk. Splitting to 24 hours instead (as an earlier version did)
+multiplied the task graph roughly sixfold for bit-identical output, because the
+reduction immediately regroups what the split had just divided.
 
 Spatial chunking is left at the source store's native values, and the region
 crop is snapped outward to start on a native chunk boundary (see
@@ -45,7 +49,6 @@ SURFACE_PRESSURE = "PRES_surface"
 EASTWARD_WIND = "UGRD_10maboveground"
 NORTHWARD_WIND = "VGRD_10maboveground"
 
-HOURS_PER_DAY = 24
 DAILY_STATISTICS = ("min", "mean", "max")
 PASCALS_PER_HECTOPASCAL = np.float32(100.0)
 
@@ -329,25 +332,26 @@ def native_spatial_chunks(dataset):
 
 
 def prepare_dataset(dataset, region):
-    """Crop to the region bounding box, cast to float32, mask, and rechunk time.
+    """Crop to the region bounding box, cast to float32, and mask.
 
-    Chunking time in 24-hour blocks puts each daily resample group entirely
-    inside one chunk, so the reduction never crosses a chunk boundary. Spatial
-    chunking is deliberately left alone: `region`'s slices are already snapped
-    to native chunk boundaries, so the cropped array's chunks line up with both
-    the source store and the output store without any rechunk.
+    No rechunking happens here. AORC's native 144-hour time chunk already holds
+    six whole, midnight-aligned days, so a daily `resample` group never crosses
+    a chunk boundary -- splitting to 24 hours would only inflate the task graph
+    (~6x, measured) for identical output. Spatial chunking is likewise native:
+    `region`'s slices are snapped to chunk boundaries, so the cropped array
+    lines up with both the source store and the output store as-is.
 
     The cast to float32 happens before masking so that every downstream
     intermediate is float32 too, not just the kernel outputs.
 
     :param dataset: Full-domain AORC dataset
     :param region: A `mask.Region` whose slices are snapped to chunk boundaries
-    :return: Cropped, masked, time-rechunked float32 dataset
+    :return: Cropped, masked float32 dataset at the source's native chunking
     """
     cropped = dataset.isel(
         latitude=region.latitude_slice, longitude=region.longitude_slice
     ).astype(np.float32)
-    return cropped.where(region.mask).chunk({"time": HOURS_PER_DAY})
+    return cropped.where(region.mask)
 
 
 def daily_metrics(aorc_dataset, metric_names):

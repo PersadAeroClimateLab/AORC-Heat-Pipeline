@@ -231,7 +231,7 @@ def test_daily_metrics_sets_variable_attributes(synthetic_aorc_dataset):
     assert result.attrs["source_version"] == "AORC Version 1.1"
 
 
-def test_prepare_dataset_crops_masks_and_chunks(synthetic_aorc_dataset):
+def test_prepare_dataset_crops_and_masks(synthetic_aorc_dataset):
     from aorc_heat.mask import Region
 
     values = np.array([[True, False], [False, False]])
@@ -245,27 +245,26 @@ def test_prepare_dataset_crops_masks_and_chunks(synthetic_aorc_dataset):
     )
     region = Region(mask=mask, latitude_slice=slice(0, 2), longitude_slice=slice(0, 2))
 
-    prepared = pipeline.prepare_dataset(synthetic_aorc_dataset, region)
-
-    assert prepared.chunksizes["time"] == (24, 24)
-    loaded = prepared.compute()
+    loaded = pipeline.prepare_dataset(synthetic_aorc_dataset, region).compute()
     assert not np.isnan(loaded["TMP_2maboveground"].isel(latitude=0, longitude=0)).any()
     assert bool(np.isnan(loaded["TMP_2maboveground"].isel(latitude=1, longitude=1)).all())
 
 
-def test_prepare_dataset_preserves_native_spatial_chunking(synthetic_aorc_dataset):
-    """`prepare_dataset` rechunks time only, leaving spatial chunks untouched.
+def test_prepare_dataset_leaves_chunking_at_the_source_native_values(synthetic_aorc_dataset):
+    """`prepare_dataset` does not rechunk -- time or space.
 
-    Alignment is the region's responsibility now, not this function's: the
-    crop is snapped to native chunk boundaries before it ever gets here, so
-    rechunking space would be a pointless shuffle. Verified on a grid chunked
-    into two spatial chunks, which would collapse to one if the function
-    imposed its own chunking.
+    AORC's native 144-hour chunk already holds six midnight-aligned days, so a
+    daily resample group never crosses a boundary without any rechunk;
+    splitting to 24 hours only inflates the graph. Spatial alignment is the
+    region's responsibility, snapped before this function is called. So whatever
+    chunking the source arrives with must survive untouched -- checked here on a
+    deliberately odd 6-hour time chunk and 1-cell spatial chunks, both of which
+    an imposed rechunk would erase.
     """
     from aorc_heat.mask import Region
 
     source = synthetic_aorc_dataset.chunk(
-        {"time": 24, "latitude": 1, "longitude": 1}
+        {"time": 6, "latitude": 1, "longitude": 1}
     )
     mask = xr.DataArray(
         np.ones((2, 2), dtype=bool),
@@ -279,9 +278,26 @@ def test_prepare_dataset_preserves_native_spatial_chunking(synthetic_aorc_datase
 
     prepared = pipeline.prepare_dataset(source, region)
 
-    assert prepared.chunksizes["time"] == (24, 24)
+    assert prepared.chunksizes["time"] == (6,) * 8  # 48 hours / 6, untouched
     assert prepared.chunksizes["latitude"] == (1, 1)
     assert prepared.chunksizes["longitude"] == (1, 1)
+
+
+def test_native_time_chunking_gives_identical_daily_reductions(synthetic_aorc_dataset):
+    """The daily min/mean/max must not depend on the input's time chunking.
+
+    This is what licenses leaving time at AORC's native 144 hours instead of
+    rechunking to 24: the reduction is chunk-invariant, so the cheaper chunking
+    is free. If a future change makes the reduction chunk-sensitive, this fails.
+    """
+    native = synthetic_aorc_dataset  # fixture is chunked at 24h
+    six_day = synthetic_aorc_dataset.chunk({"time": 48})  # one chunk spanning both days
+
+    a = pipeline.daily_metrics(native, ALL_METRICS).compute()
+    b = pipeline.daily_metrics(six_day, ALL_METRICS).compute()
+
+    for name in a.data_vars:
+        np.testing.assert_array_equal(a[name].values, b[name].values)
 
 
 def test_prepare_dataset_casts_to_float32(synthetic_aorc_dataset):

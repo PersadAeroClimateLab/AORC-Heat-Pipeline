@@ -48,6 +48,8 @@ Zarr chunks are atomic, so a crop starting mid-chunk downloads the whole chunk a
 
 That single decision is what lets `prepare_dataset` and `write_block` skip spatial rechunking entirely: source, dask graph, and output store share one chunk grid. The Texas bbox starts at latitude 701 and longitude 2803 — both prime — so without snapping the first chunk is a partial remainder and the first region write fails zarr's alignment check after a full year of compute.
 
+Time is left native too. AORC's 144-hour chunk is exactly six midnight-aligned days, so a daily `resample` group never crosses a boundary and `prepare_dataset` does no time rechunk either. Splitting to 24 hours (an earlier version did) inflated the per-year task graph ~6x for bit-identical output — the reduction just regroups what the split divided.
+
 ### Writes must stay sequential
 
 `write_block` passes `safe_chunks=False`, because year lengths alternate 365/366 and no fixed time chunk divides every year boundary. It is safe only because of two things that must both hold:
