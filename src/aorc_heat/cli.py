@@ -126,12 +126,10 @@ def main(argv=None):
     :param argv: Argument list, defaulting to sys.argv[1:]
     :return: Process exit code
     """
-    import xarray as xr
     from dask.distributed import LocalCluster
 
     arguments = build_parser().parse_args(argv)
     metric_names = selected_metrics(arguments)
-    xr.set_options(use_flox=True)
 
     cluster = LocalCluster(
         n_workers=arguments.cores,

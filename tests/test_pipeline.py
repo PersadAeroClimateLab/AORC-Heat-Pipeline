@@ -410,6 +410,43 @@ def test_native_time_chunking_gives_identical_daily_reductions(synthetic_aorc_da
         np.testing.assert_array_equal(a[name].values, b[name].values)
 
 
+def test_daily_metrics_rejects_a_block_not_starting_at_midnight(synthetic_aorc_dataset):
+    """`coarsen(time=24)` blindly bundles 24 consecutive samples per day.
+
+    Unlike `resample`, it has no calendar awareness to fall back on, so an
+    off-midnight start would silently mislabel every day from there on
+    instead of raising -- this pins the explicit guard added for that.
+    """
+    misaligned = synthetic_aorc_dataset.isel(time=slice(1, 25))  # 24 hours, starts 01Z
+    with pytest.raises(ValueError, match="00Z"):
+        pipeline.daily_metrics(misaligned, ["temperature"])
+
+
+def test_daily_metrics_rejects_a_block_not_a_whole_number_of_days(synthetic_aorc_dataset):
+    partial = synthetic_aorc_dataset.isel(time=slice(0, 47))  # 47 hours, starts 00Z
+    with pytest.raises(ValueError, match="24-hour days"):
+        pipeline.daily_metrics(partial, ["temperature"])
+
+
+def test_daily_metrics_time_coordinate_matches_daily_time_axis(synthetic_aorc_dataset):
+    """Pins the left-labelling: `coarsen`'s `coord_func="min"` must produce the
+    same midnight timestamps `resample(time="1D")` did, since `daily_time_axis`
+    and `write_block`'s store lookup both key off day *n* of the input landing
+    on day *n* of the store's axis.
+    """
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["temperature"])
+
+    # The fixture covers 1-2 July 2000: days 182 and 183 of a leap-year axis
+    # (see test_write_block_fills_only_its_own_days, which pins the same fact
+    # from the store-write side).
+    axis = pipeline.daily_time_axis(2000, 2000)
+    expected = np.asarray(axis[182:184])
+
+    np.testing.assert_array_equal(
+        np.asarray(result["temperature_mean"].time.values), expected
+    )
+
+
 def test_prepare_dataset_casts_to_float32(synthetic_aorc_dataset):
     """Raw AORC variables are float64 on disk; everything downstream is float32."""
     from aorc_heat.mask import Region

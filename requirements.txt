@@ -8,5 +8,4 @@ cftime
 s3fs
 geopandas
 pytest
-flox
 bokeh

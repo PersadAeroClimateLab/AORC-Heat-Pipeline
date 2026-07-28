@@ -8,9 +8,13 @@ graph rather than four.
 
 Time chunking is left at AORC's native 144 hours. That is exactly six days, and
 year files start at midnight on 1 January, so every native chunk boundary falls
-on a midnight and each chunk holds six whole days. A daily `resample` group
-therefore never crosses a chunk boundary -- the property the reduction needs --
-without any rechunk. Splitting to 24 hours instead (as an earlier version did)
+on a midnight and each chunk holds six whole days. The daily reduction groups
+every 24 consecutive hours with `coarsen(time=24)`, which is therefore pure
+blockwise regrouping -- it never crosses a chunk boundary and, unlike
+`resample`, builds no pandas grouper to get there. That blockwise grouping is
+exactly why `daily_metrics` requires its input to start at 00Z and hold a whole
+number of 24-hour days: `coarsen` has no calendar awareness of its own to fall
+back on. Splitting to 24-hour chunks instead (as an earlier version did)
 multiplied the task graph roughly sixfold for bit-identical output, because the
 reduction immediately regroups what the split had just divided.
 
@@ -98,6 +102,71 @@ def _apply(kernel, *data_arrays):
         dask="parallelized",
         output_dtypes=[np.float32],
     )
+
+
+# --------------------------------------------------------------------------
+# Daily reduction: NaN-quiet replacements for coarsen's nanmin/nanmean/nanmax
+# --------------------------------------------------------------------------
+#
+# A masked cell is NaN for all 24 hours of every day (see the module
+# docstring's NaN contract), so `daily_metrics`'s `coarsen(time=24)` window
+# reduces an entirely-NaN slice for roughly half the domain, every day. The
+# obvious implementation -- `coarsen(...).min()/.mean()/.max()`, which
+# resolve to `numpy.nanmin`/`nanmean`/`nanmax` -- computes the right answer
+# (NaN) for those windows, but *also* calls `warnings.warn` unconditionally
+# to report it, once per block, which buries anything worth reading on a
+# multi-decade run exactly like the FP-flag warning `_quiet_on_masked_nan`
+# already suppresses for the hourly kernels. That warning is not gated by
+# `np.errstate` the way the kernels' invalid-operation flag is, and -- because
+# these reducers are evaluated lazily by dask, potentially in a worker thread
+# long after this module's code has returned -- wrapping the call site in
+# `warnings.catch_warnings()` would not reliably reach the warning at all.
+#
+# The three functions below sidestep the problem instead of suppressing it:
+# they never execute a code path that raises the warning, so nothing needs
+# catching regardless of when or on which thread dask evaluates them.
+#   - min/max replace NaN with +/-inf before an ordinary (non-nan-aware) min
+#     or max, then map any remaining +/-inf in the result -- meaning every
+#     value in the window was NaN -- back to NaN. Plain `min`/`max` never
+#     special-cases an all-inf slice, so this never touches the warning path.
+#   - mean divides by `count` only after replacing a zero count with one,
+#     so total/count is never literally 0/0; the result is then explicitly
+#     overwritten with NaN wherever count actually was zero. No division by
+#     zero ever happens, so there is nothing for `np.errstate` to guard.
+# Correctness against `numpy.nanmin`/`nanmean`/`nanmax` is covered by the
+# `test_daily_metrics_*_matches_manual_numpy` family; the no-warning property
+# is covered by `test_masked_cells_do_not_emit_runtime_warnings`.
+def _reduce_min_quietly(values, axis, **kwargs):
+    filled = np.where(np.isnan(values), np.asarray(np.inf, dtype=values.dtype), values)
+    reduced = filled.min(axis=axis)
+    return np.where(np.isinf(reduced), np.asarray(np.nan, dtype=values.dtype), reduced)
+
+
+def _reduce_max_quietly(values, axis, **kwargs):
+    filled = np.where(np.isnan(values), np.asarray(-np.inf, dtype=values.dtype), values)
+    reduced = filled.max(axis=axis)
+    return np.where(np.isinf(reduced), np.asarray(np.nan, dtype=values.dtype), reduced)
+
+
+def _reduce_mean_quietly(values, axis, **kwargs):
+    valid = ~np.isnan(values)
+    count = valid.sum(axis=axis, dtype=np.float32)
+    total = np.where(valid, values, np.asarray(0, dtype=values.dtype)).sum(
+        axis=axis, dtype=np.float32
+    )
+    safe_count = np.where(count == 0, np.float32(1), count)
+    mean = total / safe_count
+    return np.where(count == 0, np.asarray(np.nan, dtype=np.float32), mean)
+
+
+#: One quiet reducer per name in `DAILY_STATISTICS`, passed to
+#: `Coarsen.reduce` in place of the `.min()`/`.mean()`/`.max()` convenience
+#: methods (which resolve to the warning-raising `nanmin`/`nanmean`/`nanmax`).
+_QUIET_DAILY_REDUCERS = {
+    "min": _reduce_min_quietly,
+    "mean": _reduce_mean_quietly,
+    "max": _reduce_max_quietly,
+}
 
 
 def _variable_attributes(metric_name, statistic):
@@ -362,11 +431,12 @@ def prepare_dataset(dataset, region):
     """Crop to the region bounding box, cast to float32, and mask.
 
     No rechunking happens here. AORC's native 144-hour time chunk already holds
-    six whole, midnight-aligned days, so a daily `resample` group never crosses
-    a chunk boundary -- splitting to 24 hours would only inflate the task graph
-    (~6x, measured) for identical output. Spatial chunking is likewise native:
-    `region`'s slices are snapped to chunk boundaries, so the cropped array
-    lines up with both the source store and the output store as-is.
+    six whole, midnight-aligned days, so `daily_metrics`'s `coarsen(time=24)`
+    grouping never crosses a chunk boundary -- splitting to 24 hours would only
+    inflate the task graph (~6x, measured) for identical output. Spatial
+    chunking is likewise native: `region`'s slices are snapped to chunk
+    boundaries, so the cropped array lines up with both the source store and
+    the output store as-is.
 
     The cast to float32 happens before masking so that every downstream
     intermediate is float32 too, not just the kernel outputs.
@@ -381,23 +451,90 @@ def prepare_dataset(dataset, region):
     return cropped.where(region.mask)
 
 
+def _first_timestamp(aorc_dataset):
+    """The dataset's first time value, normalised to something with `.hour`.
+
+    Mirrors `_as_comparable_dates`: a "standard"-calendar time coordinate may
+    arrive as either cftime objects (already `.hour`-bearing) or, once it has
+    round-tripped through zarr, plain `numpy.datetime64` (which is not), so
+    the latter is converted through `pandas.Timestamp`.
+
+    :param aorc_dataset: Dataset with a `time` dimension of size >= 1
+    :return: The first timestamp, with `.hour`/`.minute`/`.second`/`.microsecond`
+    """
+    first = aorc_dataset["time"].values[0]
+    if isinstance(first, np.datetime64):
+        first = pd.Timestamp(first)
+    return first
+
+
+def _validate_starts_on_midnight_whole_days(aorc_dataset):
+    """Raise unless the input begins at 00Z and holds a whole number of days.
+
+    `resample(time="1D")` grouped by calendar date, so it tolerated an
+    off-midnight start or a partial trailing day -- it just produced a short
+    or oddly-bounded first/last group. `coarsen(time=24)` has no calendar
+    awareness: it blindly bundles every 24 consecutive samples, so this
+    assumption (previously just a comment on `prepare_dataset`) becomes
+    load-bearing. Both `daily_time_axis` and `write_block`'s store lookup
+    depend on day *n* of the input actually being calendar day *n*, so a
+    violation must fail loudly here rather than silently mislabel every day
+    from the violation onward.
+
+    :param aorc_dataset: Prepared AORC dataset about to be reduced
+    :raises ValueError: If the first timestamp is not 00Z, or the time
+        dimension's length is not a multiple of 24 hours
+    """
+    hour_count = aorc_dataset.sizes["time"]
+    if hour_count % 24 != 0:
+        raise ValueError(
+            "daily_metrics requires a whole number of 24-hour days; got "
+            f"{hour_count} hours."
+        )
+    first = _first_timestamp(aorc_dataset)
+    if (first.hour, first.minute, first.second, first.microsecond) != (0, 0, 0, 0):
+        raise ValueError(
+            "daily_metrics requires the input to start at 00Z; first "
+            f"timestamp is {first}."
+        )
+
+
 def daily_metrics(aorc_dataset, metric_names):
     """Reduce hourly AORC data to daily min, mean, and max for each metric.
 
-    :param aorc_dataset: Prepared AORC dataset, chunked at 24 hours
+    The reduction is `coarsen(time=24)`, a blockwise regrouping rather than a
+    calendar-aware resample, so the input must start at 00Z and hold a whole
+    number of 24-hour days -- checked explicitly here rather than assumed. The
+    output time coordinate is left-labelled at midnight, matching what
+    `resample(time="1D")` produced and what `daily_time_axis` and
+    `write_block` expect: `coord_func="min"` takes each day's earliest
+    timestamp rather than coarsen's default of averaging the window's
+    coordinates into a spurious midday value. Each statistic is computed with
+    `Coarsen.reduce` and one of `_QUIET_DAILY_REDUCERS` rather than the
+    `.min()`/`.mean()`/`.max()` convenience methods, so that a day where every
+    hour is masked NaN -- true for roughly half the domain, every day --
+    resolves to NaN without dask's evaluation of `numpy.nanmin`/`nanmean`/
+    `nanmax` emitting a "Mean of empty slice" / "All-NaN slice encountered"
+    warning per block, once per day, across a 46-year run.
+
+    :param aorc_dataset: Prepared AORC dataset, starting at 00Z and holding a
+        whole number of 24-hour days
     :param metric_names: Names of metrics from `METRICS`
     :return: Lazy Dataset with one `{metric}_{statistic}` variable per pair.
         Metrics that were not requested are absent, not NaN-filled.
+    :raises ValueError: If `aorc_dataset` does not start at 00Z or does not
+        hold a whole number of 24-hour days
     """
     _validate_metric_names(metric_names)
+    _validate_starts_on_midnight_whole_days(aorc_dataset)
     derived = _derived_inputs(aorc_dataset, metric_names)
 
     daily = {}
     for name in metric_names:
         hourly = METRICS[name].compute(derived)
-        grouped = hourly.resample(time="1D")
+        grouped = hourly.coarsen(time=24, coord_func="min")
         for statistic in DAILY_STATISTICS:
-            reduced = getattr(grouped, statistic)().astype(np.float32)
+            reduced = grouped.reduce(_QUIET_DAILY_REDUCERS[statistic]).astype(np.float32)
             reduced.attrs = _variable_attributes(name, statistic)
             daily[f"{name}_{statistic}"] = reduced
 
