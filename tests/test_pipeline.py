@@ -17,6 +17,7 @@ ALL_METRICS = [
     "wet_bulb_temperature",
     "temperature",
     "relative_humidity",
+    "specific_humidity",
 ]
 
 
@@ -34,21 +35,31 @@ def test_required_variables_only_reads_wind_for_apparent_temperature():
     assert pipeline.NORTHWARD_WIND in with_wind
 
 
-def test_required_variables_always_reads_air_temperature():
+def test_required_variables_matches_each_metric_declared_inputs():
+    # required_variables is exactly the metric's declared inputs -- the contract
+    # `_derived_inputs` relies on to know which intermediates it can build.
     for name in ALL_METRICS:
-        assert pipeline.AIR_TEMPERATURE in pipeline.required_variables([name])
+        assert pipeline.required_variables([name]) == sorted(pipeline.METRICS[name].inputs)
 
 
-def test_required_variables_reads_humidity_and_pressure_except_for_temperature():
-    # Every metric except `temperature` derives vapour pressure, which needs
-    # both specific humidity and surface pressure. `temperature` needs neither.
+def test_single_input_metrics_read_only_their_own_variable():
+    # `temperature` and `specific_humidity` are raw variables carried through
+    # the daily reduction, so each reads exactly one AORC variable -- neither
+    # pulls the others off S3.
+    assert pipeline.required_variables(["temperature"]) == [pipeline.AIR_TEMPERATURE]
+    assert pipeline.required_variables(["specific_humidity"]) == [pipeline.SPECIFIC_HUMIDITY]
+
+
+def test_derived_metrics_read_humidity_and_pressure():
+    # Every metric that derives vapour pressure needs both specific humidity and
+    # surface pressure; that is all of them except the two raw-passthrough ones.
+    passthrough = {"temperature", "specific_humidity"}
     for name in ALL_METRICS:
+        if name in passthrough:
+            continue
         variables = pipeline.required_variables([name])
-        if name == "temperature":
-            assert variables == [pipeline.AIR_TEMPERATURE]
-        else:
-            assert pipeline.SPECIFIC_HUMIDITY in variables
-            assert pipeline.SURFACE_PRESSURE in variables
+        assert pipeline.SPECIFIC_HUMIDITY in variables
+        assert pipeline.SURFACE_PRESSURE in variables
 
 
 def test_required_variables_rejects_unknown_metric():
@@ -204,6 +215,50 @@ def test_relative_humidity_is_a_percent_not_fahrenheit(synthetic_aorc_dataset):
 def test_temperature_is_fahrenheit(synthetic_aorc_dataset):
     result = pipeline.daily_metrics(synthetic_aorc_dataset, ["temperature"])
     assert result["temperature_mean"].attrs["units"] == "deg_F"
+
+
+def test_daily_metrics_specific_humidity_matches_manual_numpy(synthetic_aorc_dataset):
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["specific_humidity"]).compute()
+
+    loaded = synthetic_aorc_dataset.compute()
+    # Carried straight through in kg/kg -- no conversion at all.
+    hourly = loaded["SPFH_2maboveground"].values.astype(np.float32)
+
+    for day in (0, 1):
+        window = hourly[day * 24 : (day + 1) * 24]
+        np.testing.assert_allclose(
+            result["specific_humidity_min"].isel(time=day).values, window.min(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["specific_humidity_mean"].isel(time=day).values, window.mean(axis=0), rtol=1e-5
+        )
+        np.testing.assert_allclose(
+            result["specific_humidity_max"].isel(time=day).values, window.max(axis=0), rtol=1e-5
+        )
+
+
+def test_specific_humidity_is_kg_per_kg(synthetic_aorc_dataset):
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["specific_humidity"])
+    assert result["specific_humidity_mean"].attrs["units"] == "kg/kg"
+
+
+@pytest.mark.parametrize("metric", ALL_METRICS)
+def test_each_metric_computes_when_requested_alone(synthetic_aorc_dataset, metric):
+    """A metric run by itself must succeed on a dataset holding only its inputs.
+
+    `open_aorc_year` subsets the opened year to `required_variables`, so a
+    single-metric run reaches `daily_metrics` with only that metric's variables
+    present. This reproduces that subset -- without it, a metric that reads a
+    strict subset of the raw variables (temperature, specific_humidity) crashed
+    with a KeyError inside `_derived_inputs`, and no full-fixture test caught it.
+    """
+    subset = synthetic_aorc_dataset[pipeline.required_variables([metric])]
+
+    result = pipeline.daily_metrics(subset, [metric]).compute()
+
+    assert sorted(result.data_vars) == [f"{metric}_{s}" for s in ("max", "mean", "min")]
+    # A cell inside the (all-True) fixture region must carry real data.
+    assert np.isfinite(result[f"{metric}_mean"].values).all()
 
 
 def test_daily_metrics_orders_statistics_min_le_mean_le_max(synthetic_aorc_dataset):

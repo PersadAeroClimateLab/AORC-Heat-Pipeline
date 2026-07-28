@@ -120,28 +120,35 @@ def _variable_attributes(metric_name, statistic):
 def _derived_inputs(aorc_dataset, metric_names):
     """Build the intermediate quantities the requested metrics need.
 
-    Each quantity is built once and handed to every metric that uses it. Air
-    temperature, pressure, humidity, and vapour pressure are unconditional
-    because most metrics depend on them; relative humidity and wind speed are
-    built only when a metric that needs them was requested.
+    Each quantity is built once and handed to every metric that uses it. A base
+    intermediate is built only when the raw variable it derives from is present,
+    because `open_aorc_year` subsets the dataset to exactly the requested
+    metrics' `inputs` -- so a variable is present precisely when some requested
+    metric needs it. Building unconditionally would `KeyError` on a metric like
+    `temperature` that reads air temperature alone. Relative humidity and wind
+    speed are further guarded on the specific metric that consumes them.
 
-    :param aorc_dataset: Dataset holding raw AORC variables
+    :param aorc_dataset: Dataset holding the raw AORC variables the metrics need
     :param metric_names: Names of the metrics that will be computed
     :return: Mapping of intermediate name to lazy DataArray
     """
-    air_temperature_celsius = _apply(core.kelvin_to_celsius, aorc_dataset[AIR_TEMPERATURE])
-    air_pressure_hpa = aorc_dataset[SURFACE_PRESSURE] / PASCALS_PER_HECTOPASCAL
-    specific_humidity = aorc_dataset[SPECIFIC_HUMIDITY]
+    derived = {}
 
-    derived = {
-        "air_temperature_celsius": air_temperature_celsius,
-        "air_pressure_hpa": air_pressure_hpa,
-        "specific_humidity": specific_humidity,
-        "vapor_pressure_hpa": _apply(core.vapor_pressure, specific_humidity, air_pressure_hpa),
-    }
+    if AIR_TEMPERATURE in aorc_dataset:
+        derived["air_temperature_celsius"] = _apply(
+            core.kelvin_to_celsius, aorc_dataset[AIR_TEMPERATURE]
+        )
+    if SPECIFIC_HUMIDITY in aorc_dataset:
+        derived["specific_humidity"] = aorc_dataset[SPECIFIC_HUMIDITY]
+    if SURFACE_PRESSURE in aorc_dataset:
+        derived["air_pressure_hpa"] = aorc_dataset[SURFACE_PRESSURE] / PASCALS_PER_HECTOPASCAL
+    if SPECIFIC_HUMIDITY in aorc_dataset and SURFACE_PRESSURE in aorc_dataset:
+        derived["vapor_pressure_hpa"] = _apply(
+            core.vapor_pressure, derived["specific_humidity"], derived["air_pressure_hpa"]
+        )
 
     if "heat_index" in metric_names or "relative_humidity" in metric_names:
-        saturation = _apply(core.saturation_vapor_pressure, air_temperature_celsius)
+        saturation = _apply(core.saturation_vapor_pressure, derived["air_temperature_celsius"])
         derived["relative_humidity_percent"] = _apply(
             core.relative_humidity, derived["vapor_pressure_hpa"], saturation
         )
@@ -226,6 +233,16 @@ def _relative_humidity(derived):
     return derived["relative_humidity_percent"]
 
 
+def _specific_humidity(derived):
+    """Specific humidity in kg/kg.
+
+    The raw AORC value carried straight through: core.py's science is all in
+    kg/kg, so there is no conversion, and the output is neither degrees
+    Fahrenheit nor a percent.
+    """
+    return derived["specific_humidity"]
+
+
 @dataclass(frozen=True)
 class MetricSpec:
     """How to compute one metric and what raw AORC variables it needs.
@@ -281,6 +298,11 @@ METRICS = {
         inputs=(AIR_TEMPERATURE, SPECIFIC_HUMIDITY, SURFACE_PRESSURE),
         compute=_relative_humidity,
         units="percent",
+    ),
+    "specific_humidity": MetricSpec(
+        inputs=(SPECIFIC_HUMIDITY,),
+        compute=_specific_humidity,
+        units="kg/kg",
     ),
 }
 
