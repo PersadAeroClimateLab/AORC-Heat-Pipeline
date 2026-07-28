@@ -918,3 +918,150 @@ def test_masked_cells_do_not_emit_runtime_warnings(synthetic_aorc_dataset):
         values = result[f"{name}_mean"].values
         assert np.isnan(values[:, ~inside]).all(), name
         assert np.isfinite(values[:, inside]).all(), name
+
+
+# ---------------------------------------------------------------------------
+# Blocked spatial writes
+#
+# `run` no longer computes the whole bounding box. It writes one block per
+# occupied run of chunks, skipping the chunks that hold no in-region cells --
+# 38 of Texas's 88, measured. The store must come out exactly as if the whole
+# box had been written.
+# ---------------------------------------------------------------------------
+def _blocked_write_fixture(tmp_path, native_chunks=(4, 8)):
+    """A domain whose mask leaves whole chunks empty, plus its Region."""
+    from aorc_heat.mask import crop_to_bounding_box
+
+    hours = 48
+    domain = 24
+    times = xr.date_range(
+        "2000-07-01", periods=hours, freq="h", use_cftime=True, calendar="standard"
+    )
+    generator = np.random.default_rng(seed=4242)
+    shape = (hours, domain, domain)
+
+    def field(low, high):
+        return generator.uniform(low, high, size=shape).astype(np.float64)
+
+    full_domain = xr.Dataset(
+        {
+            "TMP_2maboveground": (("time", "latitude", "longitude"), field(295.0, 315.0)),
+            "SPFH_2maboveground": (("time", "latitude", "longitude"), field(0.005, 0.018)),
+            "PRES_surface": (("time", "latitude", "longitude"), field(98000.0, 101500.0)),
+        },
+        coords={
+            "time": times,
+            "latitude": np.arange(float(domain)),
+            "longitude": np.arange(float(domain)),
+        },
+    ).chunk({"time": 24, "latitude": native_chunks[0], "longitude": native_chunks[1]})
+
+    # A diagonal staircase, so entire chunks in the corners hold nothing --
+    # the property that makes blocking worth doing at all.
+    selected = np.zeros((domain, domain), dtype=bool)
+    for row in range(domain):
+        selected[row, max(0, row - 3) : min(domain, row + 4)] = True
+    full_mask = xr.DataArray(
+        selected,
+        dims=("latitude", "longitude"),
+        coords={"latitude": full_domain.latitude, "longitude": full_domain.longitude},
+    )
+    region = crop_to_bounding_box(full_mask, alignment=native_chunks)
+    return full_domain, region
+
+
+def test_occupied_blocks_actually_skip_chunks_on_this_fixture():
+    """Guard the guard: if nothing is skipped, the test below proves nothing."""
+    from aorc_heat.mask import occupied_chunk_blocks
+
+    _, region = _blocked_write_fixture(None)
+    native_chunks = (4, 8)
+    blocks = occupied_chunk_blocks(region.mask, alignment=native_chunks)
+
+    rows = -(-region.mask.sizes["latitude"] // native_chunks[0])
+    columns = -(-region.mask.sizes["longitude"] // native_chunks[1])
+    covered = sum(
+        -(-(block[0].stop - block[0].start) // native_chunks[0])
+        * -(-(block[1].stop - block[1].start) // native_chunks[1])
+        for block in blocks
+    )
+    assert covered < rows * columns, "fixture has no empty chunks to skip"
+
+
+def test_blocked_writes_reproduce_the_whole_box_write_exactly(tmp_path):
+    """Writing occupied blocks must equal writing the entire bounding box.
+
+    This is the acceptance criterion for skipping empty chunks: the saving has
+    to be invisible in the output. Cells inside skipped chunks stay at the NaN
+    `initialize_output_store` allocated, which is what the whole-box write would
+    have put there anyway, since they are masked.
+    """
+    from aorc_heat.mask import occupied_chunk_blocks
+
+    full_domain, region = _blocked_write_fixture(tmp_path)
+    native_chunks = (4, 8)
+    metrics = ["humidex", "heat_index"]
+    axis = pipeline.daily_time_axis(2000, 2000)
+    prepared = pipeline.prepare_dataset(full_domain, region)
+
+    whole_path = tmp_path / "whole.zarr"
+    template = pipeline.daily_metrics(prepared, metrics)
+    pipeline.initialize_output_store(whole_path, metrics, axis, template)
+    pipeline.write_block(whole_path, template, axis)
+
+    blocked_path = tmp_path / "blocked.zarr"
+    pipeline.initialize_output_store(blocked_path, metrics, axis, template)
+    for latitude_slice, longitude_slice in occupied_chunk_blocks(
+        region.mask, alignment=native_chunks
+    ):
+        block = prepared.isel(latitude=latitude_slice, longitude=longitude_slice)
+        pipeline.write_block(
+            blocked_path,
+            pipeline.daily_metrics(block, metrics),
+            axis,
+            latitude_slice=latitude_slice,
+            longitude_slice=longitude_slice,
+        )
+
+    whole = xr.open_zarr(whole_path, consolidated=True).compute()
+    blocked = xr.open_zarr(blocked_path, consolidated=True).compute()
+
+    assert sorted(whole.data_vars) == sorted(blocked.data_vars)
+    for name in whole.data_vars:
+        np.testing.assert_array_equal(whole[name].values, blocked[name].values)
+
+    # And the result is not vacuously all-NaN.
+    assert np.isfinite(blocked["humidex_mean"].isel(time=slice(182, 184)).values).any()
+
+
+def test_blocked_write_leaves_skipped_chunks_as_nan(tmp_path):
+    """A chunk no block touches must read back NaN, not zero or stale data."""
+    from aorc_heat.mask import occupied_chunk_blocks
+
+    full_domain, region = _blocked_write_fixture(tmp_path)
+    native_chunks = (4, 8)
+    axis = pipeline.daily_time_axis(2000, 2000)
+    prepared = pipeline.prepare_dataset(full_domain, region)
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+
+    pipeline.initialize_output_store(
+        store_path, ["humidex"], axis, pipeline.daily_metrics(prepared, ["humidex"])
+    )
+    for latitude_slice, longitude_slice in occupied_chunk_blocks(
+        region.mask, alignment=native_chunks
+    ):
+        block = prepared.isel(latitude=latitude_slice, longitude=longitude_slice)
+        pipeline.write_block(
+            store_path,
+            pipeline.daily_metrics(block, ["humidex"]),
+            axis,
+            latitude_slice=latitude_slice,
+            longitude_slice=longitude_slice,
+        )
+
+    written = xr.open_zarr(store_path, consolidated=True).compute()
+    days = written["humidex_mean"].isel(time=slice(182, 184)).values
+    inside = region.mask.values
+
+    assert not bool(np.isnan(days[:, inside]).any()), "an in-region cell lost its value"
+    assert bool(np.isnan(days[:, ~inside]).all()), "an out-of-region cell gained one"

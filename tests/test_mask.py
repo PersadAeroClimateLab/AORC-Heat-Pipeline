@@ -193,3 +193,109 @@ def test_crop_to_bounding_box_without_alignment_is_unchanged():
 
     assert region.latitude_slice == slice(3, 6)
     assert region.longitude_slice == slice(4, 8)
+
+
+# ---------------------------------------------------------------------------
+# Occupied chunk blocks
+#
+# A bounding box is a rectangle; a boundary is not. Measured on the real Texas
+# mask at AORC's native (128, 256) chunking, 38 of the 88 chunks in the box hold
+# no in-state cell at all, so 43% of every byte read from S3 and every kernel
+# evaluation was being spent on data that is masked to NaN and thrown away.
+# These blocks are the units of work that replace the whole box.
+# ---------------------------------------------------------------------------
+def _mask_from(values):
+    return xr.DataArray(
+        np.asarray(values, dtype=bool),
+        dims=("latitude", "longitude"),
+        coords={
+            "latitude": np.arange(float(np.shape(values)[0])),
+            "longitude": np.arange(float(np.shape(values)[1])),
+        },
+    )
+
+
+def test_occupied_chunk_blocks_skips_chunks_with_no_selected_cells():
+    """An empty chunk must not appear in any block."""
+    values = np.zeros((8, 12), dtype=bool)
+    values[0:4, 0:4] = True   # chunk row 0, chunk column 0
+    values[4:8, 8:12] = True  # chunk row 1, chunk column 2
+
+    blocks = mask_module.occupied_chunk_blocks(_mask_from(values), alignment=(4, 4))
+
+    assert blocks == [
+        (slice(0, 4), slice(0, 4)),
+        (slice(4, 8), slice(8, 12)),
+    ]
+
+
+def test_occupied_chunk_blocks_merges_a_horizontal_run_into_one_block():
+    """Adjacent occupied chunks in one row become a single write, not several."""
+    values = np.zeros((4, 12), dtype=bool)
+    values[:, 0:12] = True  # all three chunk columns of the single chunk row
+
+    blocks = mask_module.occupied_chunk_blocks(_mask_from(values), alignment=(4, 4))
+
+    assert blocks == [(slice(0, 4), slice(0, 12))]
+
+
+def test_occupied_chunk_blocks_splits_a_gap_into_separate_blocks():
+    """A non-convex row must not be bridged across its empty middle."""
+    values = np.zeros((4, 12), dtype=bool)
+    values[:, 0:4] = True
+    values[:, 8:12] = True  # gap at chunk column 1
+
+    blocks = mask_module.occupied_chunk_blocks(_mask_from(values), alignment=(4, 4))
+
+    assert blocks == [
+        (slice(0, 4), slice(0, 4)),
+        (slice(0, 4), slice(8, 12)),
+    ]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        np.eye(12, dtype=bool),                       # diagonal: worst case for runs
+        np.tril(np.ones((12, 12), dtype=bool)),       # triangular
+        np.ones((12, 12), dtype=bool),                # fully occupied
+    ],
+)
+def test_occupied_chunk_blocks_cover_every_selected_cell_without_overlapping(values):
+    """The blocks must partition the selected cells: full coverage, no double write.
+
+    Overlap is the dangerous half. Two blocks sharing a store chunk would
+    reintroduce exactly the read-modify-write race that `write_block` disables
+    xarray's `safe_chunks` guard against.
+    """
+    mask = _mask_from(values)
+    blocks = mask_module.occupied_chunk_blocks(mask, alignment=(4, 4))
+
+    covered = np.zeros(values.shape, dtype=int)
+    for latitude_slice, longitude_slice in blocks:
+        covered[latitude_slice, longitude_slice] += 1
+
+    assert covered.max() <= 1, "blocks overlap"
+    assert not (values & (covered == 0)).any(), "a selected cell was left uncovered"
+
+
+def test_occupied_chunk_blocks_land_on_chunk_boundaries():
+    """Every block edge must be a chunk boundary, or a region write races."""
+    values = np.zeros((12, 12), dtype=bool)
+    values[2:11, 3:10] = True
+
+    blocks = mask_module.occupied_chunk_blocks(_mask_from(values), alignment=(4, 4))
+
+    for latitude_slice, longitude_slice in blocks:
+        assert latitude_slice.start % 4 == 0
+        assert longitude_slice.start % 4 == 0
+        # A stop may fall short of a boundary only by running off the axis end.
+        assert latitude_slice.stop % 4 == 0 or latitude_slice.stop == 12
+        assert longitude_slice.stop % 4 == 0 or longitude_slice.stop == 12
+
+
+def test_occupied_chunk_blocks_rejects_an_empty_mask():
+    with pytest.raises(ValueError, match="no selected cells"):
+        mask_module.occupied_chunk_blocks(
+            _mask_from(np.zeros((4, 4), dtype=bool)), alignment=(4, 4)
+        )

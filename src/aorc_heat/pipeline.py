@@ -27,6 +27,18 @@ cropped array line up with the output store's -- the condition zarr region
 writes require. Imposing our own spatial chunking instead would mean a rechunk
 on every read for no benefit.
 
+The bounding box is not, however, the unit of work. A box is a rectangle and a
+boundary is not, so many of the chunks inside the box hold no in-region cells at
+all -- for Texas, 38 of 88, measured. `run` therefore iterates the occupied
+blocks from `mask.occupied_chunk_blocks` instead of the whole box, one dask
+graph per block. Because the opened year is lazy, a chunk-aligned `isel` never
+fetches the chunks it excludes, so those 43% of bytes are never read from S3,
+never decompressed, never pushed through a kernel, and never written; they keep
+the NaN `initialize_output_store` gave them, which is the correct value for
+them. Texas is convex within each row of chunks, so its 50 occupied chunks merge
+into just 11 blocks -- 11 writes per year, each large enough to keep a wide dask
+cluster busy.
+
 Raw AORC variables are float64 on disk. They are cast to float32 immediately
 after cropping: the science kernels compute in float32 regardless, and the
 memory-bound closed-form metrics run ~1.5x faster on float32 operands.
@@ -846,7 +858,7 @@ def chunk_sizes_aligned_to_store(start, stop, chunk):
     return tuple(sizes)
 
 
-def write_block(store_path, daily, time_axis):
+def write_block(store_path, daily, time_axis, latitude_slice=None, longitude_slice=None):
     """Write a contiguous block of daily metrics into its region of the store.
 
     The block is converted to the store's calendar, then split along time at the
@@ -856,22 +868,38 @@ def write_block(store_path, daily, time_axis):
     same sizes, so they already align. Coordinate variables are dropped because
     they already exist in the store.
 
+    `latitude_slice` and `longitude_slice` name where the block sits in the
+    store's spatial grid. They come from `mask.occupied_chunk_blocks`, so both
+    edges land on store chunk boundaries and each block covers whole chunks.
+    Omit them (the default) to write the full spatial extent, which is what a
+    caller holding an entire bounding box wants.
+
     **Contract: callers must write blocks one at a time, never concurrently.**
     `safe_chunks=False` is required because a block's first and last chunks land
-    partway into a store chunk, which xarray otherwise refuses. That refusal
-    guards against a real hazard -- two tasks read-modify-writing one chunk and
-    losing an update. Two things make it safe here, and both must hold:
+    partway into a store chunk *along time*, which xarray otherwise refuses.
+    That refusal guards against a real hazard -- two tasks read-modify-writing
+    one chunk and losing an update. Three things make it safe here, and all
+    three must hold:
 
-    1. Within a write, the split above gives every dask chunk its own store
+    1. Within a write, the time split above gives every dask chunk its own store
        chunk, so no two tasks in the same graph collide.
-    2. Across writes, adjacent blocks do share the chunk straddling their
+    2. Across writes, adjacent *years* do share the chunk straddling their
        boundary, and correctness rests on zarr read-modify-writing it. That is
        only sound while writes are sequential. Parallelising `run`'s year loop
        would silently corrupt one day at each year boundary.
+    3. Across writes, two spatial blocks of the *same* year never share a chunk,
+       because every block edge is a chunk boundary. This is why the spatial
+       slices must come from `occupied_chunk_blocks` and not from an arbitrary
+       crop -- an unaligned spatial block would reintroduce exactly the
+       read-modify-write race that `safe_chunks=False` stops xarray catching.
 
     :param store_path: Path to the output zarr store
     :param daily: A contiguous block of `daily_metrics` output
     :param time_axis: Full daily time axis
+    :param latitude_slice: Where the block sits on the store's latitude axis,
+        or None for the full extent
+    :param longitude_slice: Where the block sits on the store's longitude axis,
+        or None for the full extent
     """
     aligned = daily.convert_calendar("standard", use_cftime=True)
     region = time_region(time_axis, aligned.indexes["time"])
@@ -881,7 +909,13 @@ def write_block(store_path, daily, time_axis):
         )}
     )
     aligned = aligned.drop_vars(list(aligned.coords))
-    aligned.to_zarr(Path(store_path), region={"time": region}, safe_chunks=False)
+
+    store_region = {"time": region}
+    if latitude_slice is not None:
+        store_region["latitude"] = latitude_slice
+    if longitude_slice is not None:
+        store_region["longitude"] = longitude_slice
+    aligned.to_zarr(Path(store_path), region=store_region, safe_chunks=False)
 
 
 def open_aorc_year(year, region, variable_names, filesystem=None):
@@ -951,16 +985,46 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
 
     variables = required_variables(pending)
     first_year = open_aorc_year(start_year, region, variables, filesystem)
+    # The template spans the whole bounding box on purpose: the store's shape
+    # and spatial coordinates are those of the full box, and only the *writes*
+    # are restricted to occupied blocks. Chunks no block ever touches keep the
+    # NaN this allocation gives them, which is the right answer for them.
     initialize_output_store(store_path, pending, time_axis, daily_metrics(first_year, pending))
     _log(f"[init] Allocated {len(pending) * len(DAILY_STATISTICS)} variables in {store_path}.")
+
+    blocks = mask_module.occupied_chunk_blocks(region.mask, alignment)
+    total_chunks = -(-region.mask.sizes["latitude"] // alignment[0]) * -(
+        -region.mask.sizes["longitude"] // alignment[1]
+    )
+    covered = sum(
+        -(-(block[0].stop - block[0].start) // alignment[0])
+        * -(-(block[1].stop - block[1].start) // alignment[1])
+        for block in blocks
+    )
+    _log(
+        f"[init] {len(blocks)} occupied blocks covering {covered} of {total_chunks} "
+        f"chunks; skipping {total_chunks - covered} that hold no in-region cells."
+    )
 
     for year in range(start_year, end_year + 1):
         _log(f"[compute] Deriving metrics for {year}.")
         dataset = open_aorc_year(year, region, variables, filesystem)
-        write_block(store_path, daily_metrics(dataset, pending), time_axis)
-        # Recorded only after the write above actually succeeds, so a crash
-        # mid-write leaves the year unrecorded and `pending_metrics` correctly
-        # reports the metric as still pending on the next run.
+        # One graph per block rather than one per year. The year is lazy, so
+        # selecting a block reads only that block's chunks -- the empty ones are
+        # never fetched, decompressed, or reduced at all.
+        for index, (latitude_slice, longitude_slice) in enumerate(blocks, start=1):
+            block = dataset.isel(latitude=latitude_slice, longitude=longitude_slice)
+            write_block(
+                store_path,
+                daily_metrics(block, pending),
+                time_axis,
+                latitude_slice=latitude_slice,
+                longitude_slice=longitude_slice,
+            )
+            _log(f"[compute] {year}: wrote block {index}/{len(blocks)}.")
+        # Recorded only after every block of the year has been written, so a
+        # crash partway through leaves the year unrecorded and `pending_metrics`
+        # correctly reports the metric as still pending on the next run.
         record_completed_years(store_path, pending, [year])
         _log(f"[compute] Wrote {year}.")
 
