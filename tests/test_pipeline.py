@@ -1179,3 +1179,80 @@ def test_blocked_write_leaves_skipped_chunks_as_nan(tmp_path):
 
     assert not bool(np.isnan(days[:, inside]).any()), "an in-region cell lost its value"
     assert bool(np.isnan(days[:, ~inside]).all()), "an out-of-region cell gained one"
+
+
+def test_write_block_returns_the_region_it_wrote(tmp_path, synthetic_aorc_dataset):
+    """`run` needs the written region back to read `valid_hours` cheaply."""
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+    daily = pipeline.daily_metrics(synthetic_aorc_dataset, ["humidex"])
+    pipeline.initialize_output_store(store_path, ["humidex"], axis, daily)
+
+    region = pipeline.write_block(store_path, daily, axis)
+
+    assert region["time"] == slice(182, 184)
+    assert "latitude" not in region and "longitude" not in region
+
+    spatial = pipeline.write_block(
+        store_path, daily, axis, latitude_slice=slice(0, 2), longitude_slice=slice(0, 2)
+    )
+    assert spatial == {
+        "time": slice(182, 184),
+        "latitude": slice(0, 2),
+        "longitude": slice(0, 2),
+    }
+    # And it actually indexes the store: reading it back must land on the same days.
+    written = xr.open_zarr(store_path, consolidated=True).isel(**spatial)
+    assert written.sizes["time"] == 2
+    assert not bool(np.isnan(written["humidex_mean"].values).any())
+
+
+def test_gap_logging_does_not_recompute_the_hourly_chain(tmp_path, monkeypatch):
+    """Counting gaps must read the store, not re-run the kernels.
+
+    `to_zarr` already evaluates the graph, but dask caches nothing between
+    calls, so calling `.compute()` on the same lazy Dataset again re-runs every
+    kernel and re-fetches every source chunk -- measured at +74% on top of the
+    write against local disk, and worse against S3, which would undo the saving
+    from skipping empty chunks. This pins the readback so a future refactor
+    cannot quietly reintroduce the second pass.
+    """
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+
+    hours = 48
+    times = xr.date_range(
+        "2000-07-01", periods=hours, freq="h", use_cftime=True, calendar="standard"
+    )
+    generator = np.random.default_rng(19)
+    shape = (hours, 4, 4)
+    source = xr.Dataset(
+        {"TMP_2maboveground": (("time", "latitude", "longitude"),
+                               generator.uniform(295.0, 315.0, shape))},
+        coords={
+            "time": times,
+            "latitude": np.arange(4.0),
+            "longitude": np.arange(4.0),
+        },
+    ).chunk({"time": 24})
+
+    daily = pipeline.daily_metrics(source, ["temperature"])
+    pipeline.initialize_output_store(store_path, ["temperature"], axis, daily)
+    store_region = pipeline.write_block(store_path, daily, axis)
+
+    # Any evaluation of the lazy graph after the write is the thing we forbid.
+    calls = []
+    original = pipeline.daily_metrics
+
+    def counting_daily_metrics(*args, **kwargs):
+        calls.append(1)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(pipeline, "daily_metrics", counting_daily_metrics)
+
+    written = xr.open_zarr(store_path, consolidated=True).isel(**store_region)
+    counts = written["temperature_valid_hours"].values
+
+    assert not calls, "gap counting must not rebuild the metric graph"
+    assert counts.dtype == np.uint8
+    assert (counts == 24).all()
