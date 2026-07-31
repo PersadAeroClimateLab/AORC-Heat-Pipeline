@@ -70,14 +70,22 @@ def test_required_variables_rejects_unknown_metric():
 def test_daily_metrics_returns_only_requested_metrics(synthetic_aorc_dataset):
     result = pipeline.daily_metrics(synthetic_aorc_dataset, ["humidex"])
 
-    assert sorted(result.data_vars) == ["humidex_max", "humidex_mean", "humidex_min"]
+    # Schema change: each metric now also emits a `_valid_hours` companion
+    # alongside its three statistics.
+    assert sorted(result.data_vars) == [
+        "humidex_max",
+        "humidex_mean",
+        "humidex_min",
+        "humidex_valid_hours",
+    ]
     for name in ("heat_index_mean", "wet_bulb_temperature_mean"):
         assert name not in result.data_vars
 
 
 def test_daily_metrics_produces_three_statistics_per_metric(synthetic_aorc_dataset):
     result = pipeline.daily_metrics(synthetic_aorc_dataset, ALL_METRICS)
-    assert len(result.data_vars) == len(ALL_METRICS) * 3
+    # Schema change: 3 daily statistics + 1 valid_hours companion per metric.
+    assert len(result.data_vars) == len(ALL_METRICS) * 4
     assert result.sizes["time"] == 2
     assert result.sizes["latitude"] == 2
     assert result.sizes["longitude"] == 2
@@ -85,7 +93,12 @@ def test_daily_metrics_produces_three_statistics_per_metric(synthetic_aorc_datas
 
 def test_daily_metrics_outputs_are_float32(synthetic_aorc_dataset):
     result = pipeline.daily_metrics(synthetic_aorc_dataset, ALL_METRICS).compute()
-    for variable in result.data_vars.values():
+    # `_valid_hours` is deliberately not float32 (see
+    # test_valid_hours_dtype_is_uint8_after_round_trip); this test is only
+    # about the three daily statistics.
+    for name, variable in result.data_vars.items():
+        if name.endswith("_valid_hours"):
+            continue
         assert variable.dtype == np.float32
 
 
@@ -256,7 +269,10 @@ def test_each_metric_computes_when_requested_alone(synthetic_aorc_dataset, metri
 
     result = pipeline.daily_metrics(subset, [metric]).compute()
 
-    assert sorted(result.data_vars) == [f"{metric}_{s}" for s in ("max", "mean", "min")]
+    # Schema change: 3 statistics plus the metric's own `_valid_hours` count.
+    assert sorted(result.data_vars) == [
+        f"{metric}_{s}" for s in ("max", "mean", "min", "valid_hours")
+    ]
     # A cell inside the (all-True) fixture region must carry real data.
     assert np.isfinite(result[f"{metric}_mean"].values).all()
 
@@ -276,6 +292,98 @@ def test_daily_metrics_propagates_nan(synthetic_aorc_dataset):
     result = pipeline.daily_metrics(masked, ["humidex"]).compute()
     assert bool(np.isnan(result["humidex_mean"].isel(latitude=0, longitude=0)).all())
     assert not bool(np.isnan(result["humidex_mean"].isel(latitude=1, longitude=1)).any())
+
+
+# ---------------------------------------------------------------------------
+# Missing-data handling: valid_hours and MINIMUM_VALID_HOURS suppression
+#
+# The fixture's two days are 1-2 July 2000; day index 0 is the first day.
+# `temperature` is used for most of these because it reads only TMP, so a gap
+# stamped onto TMP is not entangled with any other input's own gaps.
+# ---------------------------------------------------------------------------
+def _dataset_with_partial_day_gap(synthetic_aorc_dataset, missing_hours):
+    """The fixture with the first `missing_hours` of day 0 NaN'd at cell (0, 0).
+
+    Day 1 and every other cell stay fully covered, so a test can assert the
+    effect is local to exactly the one affected cell-day.
+    """
+    # Load before assigning: item assignment is not supported on dask-backed arrays.
+    loaded = synthetic_aorc_dataset.compute()
+    loaded["TMP_2maboveground"][:missing_hours, 0, 0] = np.nan
+    return loaded.chunk({"time": 24})
+
+
+def test_valid_hours_full_coverage_yields_24_and_unsuppressed_value(synthetic_aorc_dataset):
+    result = pipeline.daily_metrics(synthetic_aorc_dataset, ["temperature"]).compute()
+
+    assert bool((result["temperature_valid_hours"] == 24).all())
+    assert np.isfinite(result["temperature_mean"].values).all()
+
+
+def test_valid_hours_partial_coverage_suppresses_daily_statistics(synthetic_aorc_dataset):
+    gapped = _dataset_with_partial_day_gap(synthetic_aorc_dataset, missing_hours=6)
+    result = pipeline.daily_metrics(gapped, ["temperature"]).compute()
+
+    valid_hours = result["temperature_valid_hours"].isel(latitude=0, longitude=0).values
+    assert valid_hours[0] == 18  # 24 - 6 missing hours
+    assert valid_hours[1] == 24  # day 1 untouched
+
+    mean = result["temperature_mean"].isel(latitude=0, longitude=0).values
+    # Suppressed under the strict default (MINIMUM_VALID_HOURS == 24): the
+    # count survives even though the statistic it would have fed does not.
+    assert np.isnan(mean[0])
+    assert np.isfinite(mean[1])
+
+    # An unaffected cell must see neither the reduced count nor the suppression.
+    other_cell_hours = result["temperature_valid_hours"].isel(latitude=1, longitude=1).values
+    assert bool((other_cell_hours == 24).all())
+    assert np.isfinite(
+        result["temperature_mean"].isel(latitude=1, longitude=1).values
+    ).all()
+
+
+def test_valid_hours_fully_missing_day_yields_zero_and_nan(synthetic_aorc_dataset):
+    gapped = _dataset_with_partial_day_gap(synthetic_aorc_dataset, missing_hours=24)
+    result = pipeline.daily_metrics(gapped, ["temperature"]).compute()
+
+    valid_hours = result["temperature_valid_hours"].isel(latitude=0, longitude=0).values
+    assert valid_hours[0] == 0
+    assert valid_hours[1] == 24  # day 1 still untouched
+
+    mean = result["temperature_mean"].isel(latitude=0, longitude=0).values
+    assert np.isnan(mean[0])
+
+
+def test_valid_hours_dtype_is_uint8_after_round_trip(tmp_path, synthetic_aorc_dataset):
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+    axis = pipeline.daily_time_axis(2000, 2000)
+    template = _template_for(synthetic_aorc_dataset, ["temperature"])
+
+    pipeline.initialize_output_store(store_path, ["temperature"], axis, template)
+    pipeline.write_block(store_path, template, axis)
+
+    written = xr.open_zarr(store_path, consolidated=True)
+    assert written["temperature_valid_hours"].dtype == np.uint8
+    assert written["temperature_valid_hours"].compute().dtype == np.uint8
+
+
+def test_lowering_minimum_valid_hours_lets_a_partial_day_through(
+    monkeypatch, synthetic_aorc_dataset
+):
+    """MINIMUM_VALID_HOURS is the actual control, not just documentation.
+
+    Lowering it to 12 must let an 18-valid-hour day (the same gap the strict
+    default suppresses above) through with a real value.
+    """
+    monkeypatch.setattr(pipeline, "MINIMUM_VALID_HOURS", 12)
+    gapped = _dataset_with_partial_day_gap(synthetic_aorc_dataset, missing_hours=6)
+    result = pipeline.daily_metrics(gapped, ["temperature"]).compute()
+
+    valid_hours = result["temperature_valid_hours"].isel(latitude=0, longitude=0).values
+    assert valid_hours[0] == 18
+
+    mean = result["temperature_mean"].isel(latitude=0, longitude=0).values
+    assert np.isfinite(mean[0])
 
 
 def test_daily_metrics_sets_variable_attributes(synthetic_aorc_dataset):
@@ -616,7 +724,13 @@ def test_initialize_output_store_creates_requested_variables(tmp_path, synthetic
     pipeline.initialize_output_store(store_path, ["humidex"], axis, template)
 
     written = xr.open_zarr(store_path, consolidated=True)
-    assert sorted(written.data_vars) == ["humidex_max", "humidex_mean", "humidex_min"]
+    # Schema change: allocation now also creates the `_valid_hours` variable.
+    assert sorted(written.data_vars) == [
+        "humidex_max",
+        "humidex_mean",
+        "humidex_min",
+        "humidex_valid_hours",
+    ]
     assert written.sizes["time"] == 366
     assert written.chunksizes["time"][0] == pipeline.OUTPUT_TIME_CHUNK_DAYS
 

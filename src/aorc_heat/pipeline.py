@@ -68,6 +68,20 @@ NORTHWARD_WIND = "VGRD_10maboveground"
 DAILY_STATISTICS = ("min", "mean", "max")
 PASCALS_PER_HECTOPASCAL = np.float32(100.0)
 
+#: Minimum count of non-missing hourly samples (out of 24) a day must have
+#: before its min/mean/max are reported, rather than suppressed to NaN.
+#:
+#: Strict by default -- every source gap measured in the AORC archive so far
+#: is whole-day (see the module docstring's note on source data gaps), so 24
+#: and a looser value like 20 discard exactly the same data today. It also
+#: matters because daily max/min are order statistics, not just a mean with a
+#: wider error bar: a day missing its hottest hours is not noisier, it is
+#: biased low, and there is no safe way to interpolate around a missing
+#: afternoon. Lower this to ~20 to adopt the common climatological convention
+#: of keeping a day once at least 20 of its 24 hours are present, if partial
+#: days should be kept instead of dropped.
+MINIMUM_VALID_HOURS = 24
+
 GLOBAL_ATTRIBUTES = {
     "description": "Heat metrics derived from NOAA NWS AORC data provided via AWS S3 Zarr Bucket",
     "source_version": "AORC Version 1.1",
@@ -171,6 +185,18 @@ def _reduce_mean_quietly(values, axis, **kwargs):
     return np.where(count == 0, np.asarray(np.nan, dtype=np.float32), mean)
 
 
+def _count_valid_hours_reducer(values, axis, **kwargs):
+    """Count of a window's non-NaN samples -- how many of the 24 hours counted.
+
+    Takes the same `(values, axis, **kwargs)` shape as the three reducers
+    above so it can be plugged into the same `Coarsen.reduce` call, but it is
+    not a "quiet" reducer in their sense: a plain `count_nonzero` never touches
+    `numpy.nanmin`/`nanmean`/`nanmax`'s empty-slice warning path in the first
+    place, all-NaN window or not.
+    """
+    return np.count_nonzero(~np.isnan(values), axis=axis)
+
+
 #: One quiet reducer per name in `DAILY_STATISTICS`, passed to
 #: `Coarsen.reduce` in place of the `.min()`/`.mean()`/`.max()` convenience
 #: methods (which resolve to the warning-raising `nanmin`/`nanmean`/`nanmax`).
@@ -192,6 +218,24 @@ def _variable_attributes(metric_name, statistic):
         "units": METRICS[metric_name].units,
         "source_timestep": "hourly",
         "description": f"Daily {statistic} of hourly {readable} taken across 24 UTC hours",
+    }
+
+
+def _valid_hours_attributes(metric_name):
+    """CF-style attributes for one metric's `_valid_hours` variable.
+
+    Units are always "hours" -- never the metric's own units from
+    `_variable_attributes`, since this counts non-missing hourly samples
+    rather than reporting the metric's physical quantity.
+    """
+    readable = metric_name.replace("_", " ")
+    return {
+        "units": "hours",
+        "source_timestep": "hourly",
+        "description": (
+            f"Count of the 24 hourly {readable} values that were non-missing and "
+            "contributed to that day's minimum, mean, and maximum."
+        ),
     }
 
 
@@ -529,11 +573,26 @@ def daily_metrics(aorc_dataset, metric_names):
     `nanmax` emitting a "Mean of empty slice" / "All-NaN slice encountered"
     warning per block, once per day, across a 46-year run.
 
+    Each metric also gets a `{metric}_valid_hours` companion (uint8, 0-24):
+    the count of that metric's own hourly values that were non-NaN and
+    contributed to the day's statistics. It is computed from the metric's own
+    hourly series -- after the kernel, not from the raw inputs -- so it
+    reflects the union of gaps across exactly that metric's own inputs;
+    `temperature` (reads only air temperature) and `heat_index` (reads air
+    temperature, humidity, and pressure) can disagree about which days are
+    incomplete. A day whose valid-hour count falls below `MINIMUM_VALID_HOURS`
+    has its min/mean/max suppressed to NaN -- but not its `valid_hours` count,
+    which is deliberately reported even when the statistics it would have fed
+    are withheld, so the store always records *why* a value is missing (no
+    coverage at all vs. partial coverage below the threshold vs. genuinely
+    never computed).
+
     :param aorc_dataset: Prepared AORC dataset, starting at 00Z and holding a
         whole number of 24-hour days
     :param metric_names: Names of metrics from `METRICS`
-    :return: Lazy Dataset with one `{metric}_{statistic}` variable per pair.
-        Metrics that were not requested are absent, not NaN-filled.
+    :return: Lazy Dataset with `{metric}_{statistic}` and `{metric}_valid_hours`
+        variables per requested metric. Metrics that were not requested are
+        absent, not NaN-filled.
     :raises ValueError: If `aorc_dataset` does not start at 00Z or does not
         hold a whole number of 24-hour days
     """
@@ -545,8 +604,19 @@ def daily_metrics(aorc_dataset, metric_names):
     for name in metric_names:
         hourly = METRICS[name].compute(derived)
         grouped = hourly.coarsen(time=24, coord_func="min")
+
+        valid_hours = grouped.reduce(_count_valid_hours_reducer).astype(np.uint8)
+        valid_hours.attrs = _valid_hours_attributes(name)
+        daily[f"{name}_valid_hours"] = valid_hours
+
+        has_enough_coverage = valid_hours >= MINIMUM_VALID_HOURS
         for statistic in DAILY_STATISTICS:
             reduced = grouped.reduce(_QUIET_DAILY_REDUCERS[statistic]).astype(np.float32)
+            # Cells already NaN (out of region, or every hour of the metric's
+            # own inputs missing) stay NaN here regardless -- this only ever
+            # turns a *computed* value back into NaN for a day that fell short
+            # of MINIMUM_VALID_HOURS.
+            reduced = reduced.where(has_enough_coverage)
             reduced.attrs = _variable_attributes(name, statistic)
             daily[f"{name}_{statistic}"] = reduced
 
@@ -822,16 +892,35 @@ def initialize_output_store(store_path, metric_names, time_axis, template):
         if not metric_names:
             return
 
-    placeholder = dask.array.full(shape, np.nan, dtype=np.float32, chunks=chunks)
+    # Two placeholders, not one: the three daily statistics are float32 with a
+    # NaN fill (so an unwritten day reads back as missing, not as a
+    # plausible-looking value), but `valid_hours` is uint8 -- NaN has no uint8
+    # representation, so it gets its own placeholder filled with 0 instead.
+    # Keeping `DAILY_STATISTICS` itself float32-only (rather than smuggling
+    # "valid_hours" into it) is what keeps this split honest; every site that
+    # iterates `DAILY_STATISTICS` would otherwise need to special-case it.
+    float_placeholder = dask.array.full(shape, np.nan, dtype=np.float32, chunks=chunks)
+    valid_hours_placeholder = dask.array.full(shape, 0, dtype=np.uint8, chunks=chunks)
+
     variables = {
         f"{name}_{statistic}": (
             OUTPUT_DIMENSIONS,
-            placeholder,
+            float_placeholder,
             _variable_attributes(name, statistic),
         )
         for name in metric_names
         for statistic in DAILY_STATISTICS
     }
+    variables.update(
+        {
+            f"{name}_valid_hours": (
+                OUTPUT_DIMENSIONS,
+                valid_hours_placeholder,
+                _valid_hours_attributes(name),
+            )
+            for name in metric_names
+        }
+    )
     allocation = xr.Dataset(
         variables,
         coords={
@@ -844,7 +933,22 @@ def initialize_output_store(store_path, metric_names, time_axis, template):
     # Without an explicit fill value, zarr defaults to 0.0 for float arrays and
     # days that were never written would read back as a plausible-looking zero
     # instead of NaN.
-    encoding = {name: {"_FillValue": np.float32("nan")} for name in variables}
+    #
+    # `valid_hours` gets no `_FillValue` at all, deliberately: it is uint8, so
+    # NaN is not representable, and 0 is already the right "never computed"
+    # value -- indistinguishable, on purpose, from a day this run genuinely
+    # found zero valid hours for. Declaring an explicit `_FillValue` here
+    # would not just be redundant, it would actively break the dtype: xarray's
+    # CF decoding treats any integer variable carrying a `_FillValue` as
+    # needing mask-and-scale handling and widens it to int64 on read, even
+    # though nothing here is ever masked (0 is real data, not a sentinel).
+    # Leaving the attribute off keeps the round trip uint8 -- zarr's own
+    # default fill already zero-fills unwritten chunks with no encoding needed.
+    encoding = {
+        f"{name}_{statistic}": {"_FillValue": np.float32("nan")}
+        for name in metric_names
+        for statistic in DAILY_STATISTICS
+    }
 
     allocation.to_zarr(
         store_path,
@@ -971,6 +1075,14 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
     :param end_year: Last calendar year, inclusive
     :param filesystem: Optional preconfigured s3fs filesystem
     :return: Path to the output store
+
+    Each year's block loop makes one extra pass over that block's
+    `valid_hours` variables, purely to log source-gap coverage (see the
+    `[compute]` line below): `write_block` already computes them once to
+    write the store, and logging re-computes them a second time from the same
+    lazy graph to summarize before moving on, rather than plumbing the
+    already-computed values back out of `to_zarr`. Cheap relative to the
+    kernel evaluation and I/O it sits next to, but real.
     """
     from aorc_heat import mask as mask_module
 
@@ -1011,7 +1123,12 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
     # are restricted to occupied blocks. Chunks no block ever touches keep the
     # NaN this allocation gives them, which is the right answer for them.
     initialize_output_store(store_path, pending, time_axis, daily_metrics(first_year, pending))
-    _log(f"[init] Allocated {len(pending) * len(DAILY_STATISTICS)} variables in {store_path}.")
+    # +1 per metric for its `_valid_hours` companion, alongside the three
+    # float32 statistics in DAILY_STATISTICS.
+    _log(
+        f"[init] Allocated {len(pending) * (len(DAILY_STATISTICS) + 1)} variables "
+        f"in {store_path}."
+    )
 
     blocks = mask_module.occupied_chunk_blocks(region.mask, alignment)
     total_chunks = -(-region.mask.sizes["latitude"] // alignment[0]) * -(
@@ -1030,19 +1147,42 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
     for year in range(start_year, end_year + 1):
         _log(f"[compute] Deriving metrics for {year}.")
         dataset = open_aorc_year(year, region, variables, filesystem)
+        # In-region cell-days summed across every pending metric's own
+        # `valid_hours` -- a cell-day incomplete for two requested metrics is
+        # counted twice, because the two metrics can disagree about which
+        # days are incomplete (see `daily_metrics`'s docstring). 24 here is
+        # literal hour-of-day completeness, not `MINIMUM_VALID_HOURS`: this
+        # log reports actual source coverage regardless of how lenient the
+        # suppression threshold is configured to be.
+        incomplete_cell_days = 0
+        fully_missing_cell_days = 0
         # One graph per block rather than one per year. The year is lazy, so
         # selecting a block reads only that block's chunks -- the empty ones are
         # never fetched, decompressed, or reduced at all.
         for index, (latitude_slice, longitude_slice) in enumerate(blocks, start=1):
             block = dataset.isel(latitude=latitude_slice, longitude=longitude_slice)
+            block_mask = region.mask.isel(
+                latitude=latitude_slice, longitude=longitude_slice
+            ).values
+            daily = daily_metrics(block, pending)
             write_block(
                 store_path,
-                daily_metrics(block, pending),
+                daily,
                 time_axis,
                 latitude_slice=latitude_slice,
                 longitude_slice=longitude_slice,
             )
+            valid_hours = daily[[f"{name}_valid_hours" for name in pending]].compute()
+            for name in pending:
+                in_region_hours = valid_hours[f"{name}_valid_hours"].values[:, block_mask]
+                incomplete_cell_days += int(np.count_nonzero(in_region_hours < 24))
+                fully_missing_cell_days += int(np.count_nonzero(in_region_hours == 0))
             _log(f"[compute] {year}: wrote block {index}/{len(blocks)}.")
+        _log(
+            f"[compute] {year}: {incomplete_cell_days} in-region cell-days incomplete "
+            f"(valid_hours<24), {fully_missing_cell_days} fully missing (valid_hours==0), "
+            f"summed across {len(pending)} metric(s)."
+        )
         # Recorded only after every block of the year has been written, so a
         # crash partway through leaves the year unrecorded and `pending_metrics`
         # correctly reports the metric as still pending on the next run.

@@ -63,6 +63,14 @@ One store, `aorc_heat_metrics.zarr`, holding only the metrics actually computed 
 
 Completion is recorded per year in the `completed_years` store attribute *after* each successful write. `pending_metrics` treats a metric as done only when the record covers every requested year, so an interrupted run recomputes instead of reporting success over NaN. Recovery granularity is the metric, not the year.
 
+### Source data gaps and what NaN means in the output
+
+The upstream NOAA AORC archive itself has gaps, measured directly rather than assumed: each is exactly one native 128×256 chunk tile, out for a contiguous run of whole hours, a different tile on each occasion (`(10,4)` in Oct 1979, `(7,3)` in Jun 1981), and — on every occasion checked — every affected cell is missing for all 24 hours of the day, never partially. Separately, AORC's archive starts 1 February 1979; January 1979 does not exist upstream, and the pipeline writes that short year at store index 31 without padding a fake January in front of it.
+
+Before this was handled, that meant NaN in the output was overloaded three ways — out-of-region, source gap, and never-computed were indistinguishable — and a day covered by only part of its 24 hours would silently reduce over the surviving hours and write an ordinary-looking, silently biased value (a daily max missing the afternoon reads low with nothing recording it).
+
+Every metric now also emits `{metric}_valid_hours` (uint8, 0–24): the count of that metric's own hourly values that were non-NaN, from that metric's own hourly series so metrics with different inputs can disagree about which days are incomplete. `MINIMUM_VALID_HOURS` (in `pipeline.py`) is the coverage floor below which a day's min/mean/max are suppressed to NaN — strict (24) by default, because every gap measured so far is whole-day so a looser floor changes nothing yet, and because daily min/max are order statistics that a partial day biases rather than just makes noisier. `{metric}_valid_hours` itself is **never** suppressed, even on a day whose statistics were: that is what lets NaN in the store mean, unambiguously, "no value," while `valid_hours` on that same cell-day still answers why — 0 for out-of-region or a fully-missing day, a number below `MINIMUM_VALID_HOURS` for a partial one, 24 for a real value.
+
 ## Conventions
 
 - All metric outputs are degrees Fahrenheit (`units: "deg_F"`).
