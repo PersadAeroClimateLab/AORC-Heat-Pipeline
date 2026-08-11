@@ -9,6 +9,8 @@ WORKDIR /project
 
 COPY . .
 
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip \
+    && pip install -r requirements.txt \
+    && pip install --no-deps -e .
 
-CMD ["python", "run.py"]
+CMD ["aorc-heat", "--help"]

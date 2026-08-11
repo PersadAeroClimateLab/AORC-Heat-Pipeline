@@ -1,0 +1,61 @@
+[csc3323@thunderhead-4 AORC-Heat-Pipeline]$ apptainer run --bind "$PWD":/project aorc.sif aorc-heat --metrics temperature relative_humidity --output-dir ./outputs/ --cores 40 --memory-limit 20GB
+<Client: 'tcp://127.0.0.1:28975' processes=40 threads=40, memory=745.06 GiB>
+1785247519.605266 [init] Computing temperature, relative_humidity for 1979-2024.
+1785247521.360596 [init] Loading the Texas mask.
+1785247521.4882 [init] Native spatial chunks (128, 256); region cropped to latitude[640:2048] longitude[2560:4608].
+1785247525.27569 [init] Allocated 6 variables in outputs/aorc_heat_metrics.zarr.
+1785247525.275738 [compute] Deriving metrics for 1979.
+/usr/local/lib/python3.14/site-packages/distributed/client.py:3429: UserWarning: Sending large graph of size 28.49 MiB.
+This may cause some slowdown.
+Consider loading the data with Dask directly
+ or using futures or delayed objects to embed the data into the graph without repetition.
+See also https://docs.dask.org/en/stable/best-practices.html#load-data-with-dask for more information.
+  warnings.warn(
+2026-07-28 09:06:28,613 - tornado.application - ERROR - Exception in callback functools.partial(<function TCPServer._handle_connection.<locals>.<lambda> at 0x7ff5c0059e80>, <Task finished name='Task-11328' coro=<BaseTCPListener._handle_stream() done, defined at /usr/local/lib/python3.14/site-packages/distributed/comm/tcp.py:655> exception=MemoryError((6073139484287059271,), dtype('uint8'))>)
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.14/site-packages/tornado/ioloop.py", line 758, in _run_callback
+    ret = callback()
+  File "/usr/local/lib/python3.14/site-packages/tornado/tcpserver.py", line 387, in <lambda>
+    gen.convert_yielded(future), lambda f: f.result()
+                                           ~~~~~~~~^^
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/tcp.py", line 675, in _handle_stream
+    await self.on_connection(comm)
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/core.py", line 288, in on_connection
+    return await super().on_connection(comm, handshake_overrides)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/core.py", line 267, in on_connection
+    handshake = await comm.read()
+                ^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/tcp.py", line 228, in read
+    frames_nosplit = await read_bytes_rw(stream, frames_nosplit_nbytes)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/tcp.py", line 360, in read_bytes_rw
+    buf = host_array(n)
+  File "/usr/local/lib/python3.14/site-packages/distributed/protocol/utils.py", line 29, in host_array
+    return numpy.empty((n,), dtype="u1").data
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+numpy._core._exceptions._ArrayMemoryError: Unable to allocate 5.27 EiB for an array with shape (6073139484287059271,) and data type uint8
+2026-07-28 09:06:28,688 - tornado.application - ERROR - Exception in callback functools.partial(<function TCPServer._handle_connection.<locals>.<lambda> at 0x7ff5e28bdb10>, <Task finished name='Task-11613' coro=<BaseTCPListener._handle_stream() done, defined at /usr/local/lib/python3.14/site-packages/distributed/comm/tcp.py:655> exception=MemoryError((8530211521808319815,), dtype('uint8'))>)
+Traceback (most recent call last):
+  File "/usr/local/lib/python3.14/site-packages/tornado/ioloop.py", line 758, in _run_callback
+    ret = callback()
+  File "/usr/local/lib/python3.14/site-packages/tornado/tcpserver.py", line 387, in <lambda>
+    gen.convert_yielded(future), lambda f: f.result()
+                                           ~~~~~~~~^^
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/tcp.py", line 675, in _handle_stream
+    await self.on_connection(comm)
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/core.py", line 288, in on_connection
+    return await super().on_connection(comm, handshake_overrides)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/core.py", line 267, in on_connection
+    handshake = await comm.read()
+                ^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/tcp.py", line 228, in read
+    frames_nosplit = await read_bytes_rw(stream, frames_nosplit_nbytes)
+                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/local/lib/python3.14/site-packages/distributed/comm/tcp.py", line 360, in read_bytes_rw
+    buf = host_array(n)
+  File "/usr/local/lib/python3.14/site-packages/distributed/protocol/utils.py", line 29, in host_array
+    return numpy.empty((n,), dtype="u1").data
+           ~~~~~~~~~~~^^^^^^^^^^^^^^^^^^
+numpy._core._exceptions._ArrayMemoryError: Unable to allocate 7.40 EiB for an array with shape (8530211521808319815,) and data type uint8
