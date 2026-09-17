@@ -36,19 +36,21 @@ A formula in `pipeline.py` is a bug: it cannot be tested against literature valu
 
 ### The NaN contract spans three modules
 
-`prepare_dataset` masks with `.where(region.mask)`, so **roughly half the cells reaching the kernels are NaN by design**. Three consequences that are invisible from any single file:
+`pipeline.apply_mask` masks with `.where(region.mask)`, so **roughly half the cells reaching the kernels are NaN by design**. Three consequences that are invisible from any single file:
 
 1. A `core.py` function that branches on a possibly-NaN value must use `NAN_SAFE_FASTMATH`, not `fastmath=True`. The latter sets LLVM's `nnan`, which folds NaN guards away and may treat an `if/elif` as exhaustive. This produced a production-corrupting bug: `wet_bulb_temperature`'s clamp collapsed into an unconditional `else` and turned every out-of-region cell into a finite `T − 40`.
 2. Above the SIMD width (8 float32 lanes) LLVM if-converts branches into selects and evaluates both sides for all lanes, so NaN lanes raise IEEE-754's invalid-operation flag even though their results are discarded. `pipeline._apply` wraps every kernel in `errstate(invalid="ignore")` for this reason. That suppression is only safe because `test_finite_inputs_never_produce_non_finite_outputs` would catch a genuine bad computation — if that test fails, remove the suppression rather than adjusting it.
 3. Masked cells are the *expensive* ones in iterative kernels unless guarded. `wet_bulb_temperature` early-returns NaN because without it a masked cell ran the full 50-iteration cap at ~14× the cost of a real cell.
 
+**Where the mask is applied is a graph-size decision, not a correctness one.** A numpy mask is embedded in a dask graph as a literal, so masking the whole bounding box and slicing blocks out of it afterwards copies all 2.9 MB of the Texas mask into every one of the run's 506 block-year graphs — 45% of a two-metric graph, measured. `run` therefore crops once per year with `crop_to_region` (`open_aorc_year(..., mask=False)`) and calls `apply_mask` per block with that block's own slice; `prepare_dataset` remains the whole-box composition of the two. Making the mask a dask array does *not* help — the values still travel inline.
+
 ### Chunk alignment spans mask.py and pipeline.py
 
 Zarr chunks are atomic, so a crop starting mid-chunk downloads the whole chunk anyway. `mask.crop_to_bounding_box(mask, alignment=...)` therefore snaps the region **outward** to the source store's native chunk boundaries (AORC: `time=144, latitude=128, longitude=256`). This keeps cells already being transferred instead of discarding them, and makes the cropped array's first chunk a full one.
 
-That single decision is what lets `prepare_dataset` and `write_block` skip spatial rechunking entirely: source, dask graph, and output store share one chunk grid. The Texas bbox starts at latitude 701 and longitude 2803 — both prime — so without snapping the first chunk is a partial remainder and the first region write fails zarr's alignment check after a full year of compute.
+That single decision is what lets `crop_to_region` and `write_block` skip spatial rechunking entirely: source, dask graph, and output store share one chunk grid. The Texas bbox starts at latitude 701 and longitude 2803 — both prime — so without snapping the first chunk is a partial remainder and the first region write fails zarr's alignment check after a full year of compute.
 
-Time is left native too. AORC's 144-hour chunk is exactly six midnight-aligned days, so a daily `resample` group never crosses a boundary and `prepare_dataset` does no time rechunk either. Splitting to 24 hours (an earlier version did) inflated the per-year task graph ~6x for bit-identical output — the reduction just regroups what the split divided.
+Time is left native too. AORC's 144-hour chunk is exactly six midnight-aligned days, so a daily `resample` group never crosses a boundary and `crop_to_region` does no time rechunk either. Splitting to 24 hours (an earlier version did) inflated the per-year task graph ~6x for bit-identical output — the reduction just regroups what the split divided.
 
 ### Writes must stay sequential
 
@@ -56,6 +58,18 @@ Time is left native too. AORC's 144-hour chunk is exactly six midnight-aligned d
 
 - Within a write, `chunk_sizes_aligned_to_store` splits the block at the store's own boundaries, so no two dask tasks target one chunk.
 - Across writes, adjacent years share the chunk at their boundary and rely on zarr read-modify-writing it. **Parallelising `run`'s year loop would silently corrupt one day at each year boundary.**
+
+`--threads-per-worker` does not touch either guarantee: `run`'s block and year loops still issue one `to_zarr` at a time, and the tasks inside a single write still target disjoint store chunks — threads only change whether those tasks share a process.
+
+### The output time chunk bounds how much of a year must be resident
+
+`OUTPUT_TIME_CHUNK_DAYS` is 60, not a year. `daily_metrics` emits daily output in 6-day chunks (one per native 144-hour source chunk), and `write_block` rechunks that to the store's grid — so the store's time chunk *is* how many of those pieces have to exist before anything can be written. At 365 that was the whole year at once, per variable and per longitude tile: 2.85 GiB for two metrics on the widest Texas block, ~11 GiB for all eight, none of it releasable until the year finished. That is what made worker memory climb monotonically inside each year. 60 keeps the rechunk to 10 pieces, puts the store chunk at 7.5 MB (inside zarr's 1–16 MB range rather than the old 48 MB), and is a multiple of 6 so a write chunk never splits a daily group. It does **not** improve point-in-time-series reads — that cost is set by a chunk's spatial extent, not its temporal one.
+
+### Cluster shape: `--cores` is threads, not processes
+
+`--cores` is the **total** worker thread count and `--threads-per-worker` (default 1) decides how many processes that becomes. Prefer threads: the `@nb.vectorize` kernels release the GIL — measured ~5.6× on 8 threads for the full hourly chain — so a thread is real parallelism, while each *process* costs ~390 MB of interpreter, numba and JIT state before it holds any data (40 processes = 15.6 GB of a node), serialises every dependency that crosses it, and owns a memory pool it cannot lend to a neighbour. The design spec's claim that "worker count is the only dimension that matters" was measured wrong; the code is right.
+
+**`--memory-limit` is per process, so raising `--threads-per-worker` lowers the cluster total unless it is raised to match.** That is the one footgun here, which is why `main` prints the shape and its total at startup. `--cores` that is not a multiple of `--threads-per-worker` is rejected at parse time rather than floor-divided, since silently running 39 of 40 requested threads is worse than an error.
 
 ### Store semantics
 
@@ -78,6 +92,7 @@ Every metric now also emits `{metric}_valid_hours` (uint8, 0–24): the count of
 - Function names describe what is computed; parameter names carry the unit (`vapor_pressure_hpa`, `air_temperature_celsius`). Putting the unit in the function name collides with other functions' parameter names.
 - `core.vapor_pressure` takes ambient pressure as a second argument. It does not assume 1013.25 hPa, so every metric requires `PRES_surface`.
 - `core.heat_index` takes Fahrenheit **and returns Fahrenheit**. Converting its result again is a silent, plausible-looking bug.
+- **Every `core` kernel must reach dask through `pipeline._apply`.** `dask.tokenize` has no hash for a numba `DUFunc`, so anything that hands one to dask without a `__dask_tokenize__` falls back to `_normalize_pickle`, which pickles and *unpickles* it — and each unpickle registers typing templates in numba's process-global registries, which are never pruned. That leaked ~8,000 objects per block write, in the client and in every worker. `_quiet_on_masked_nan` attaches the token, so `_apply` is safe; calling `xr.apply_ufunc` (or `map_blocks`) with a bare kernel is not.
 
 ## Skills
 

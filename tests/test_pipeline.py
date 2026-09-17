@@ -575,6 +575,194 @@ def test_prepare_dataset_casts_to_float32(synthetic_aorc_dataset):
         assert variable.dtype == np.float32, name
 
 
+def test_masking_a_block_matches_masking_the_whole_box(synthetic_aorc_dataset):
+    """`run`'s crop-then-mask-per-block path must give the same values.
+
+    `run` no longer masks the whole bounding box and slices blocks out of the
+    result; it crops once per year and masks each block with that block's own
+    slice of the mask, so the mask embedded in a block's task graph is the
+    block's slice rather than all of it (see `pipeline.apply_mask`). That is
+    only a graph-size optimisation if the two orders agree exactly, which is
+    what this pins.
+    """
+    from aorc_heat.mask import Region
+
+    values = np.array([[True, False], [True, True]])
+    mask = xr.DataArray(
+        values,
+        dims=("latitude", "longitude"),
+        coords={
+            "latitude": synthetic_aorc_dataset.latitude,
+            "longitude": synthetic_aorc_dataset.longitude,
+        },
+    )
+    region = Region(mask=mask, latitude_slice=slice(0, 2), longitude_slice=slice(0, 2))
+    block = (slice(0, 2), slice(1, 2))
+
+    whole_box_first = (
+        pipeline.prepare_dataset(synthetic_aorc_dataset, region)
+        .isel(latitude=block[0], longitude=block[1])
+        .compute()
+    )
+    block_first = pipeline.apply_mask(
+        pipeline.crop_to_region(synthetic_aorc_dataset, region).isel(
+            latitude=block[0], longitude=block[1]
+        ),
+        region.mask.isel(latitude=block[0], longitude=block[1]),
+    ).compute()
+
+    for name in whole_box_first.data_vars:
+        np.testing.assert_array_equal(
+            block_first[name].values, whole_box_first[name].values, err_msg=name
+        )
+    # The mask under this block is [False, True], so the two rows must differ:
+    # a test where every cell is in-region would pass even with no mask at all.
+    column = block_first["TMP_2maboveground"]
+    assert bool(np.isnan(column.isel(latitude=0)).all())
+    assert bool(np.isfinite(column.isel(latitude=1)).all())
+
+
+def test_kernel_wrappers_tokenize_without_pickling_the_numba_kernel():
+    """`_apply` must not send a numba `DUFunc` down dask's pickle fallback.
+
+    `dask.tokenize` has no hash for a `DUFunc`, so without an explicit
+    `__dask_tokenize__` it falls back to `_normalize_pickle`, which pickles and
+    *unpickles* the wrapper -- and every unpickle registers typing templates in
+    numba's process-global registries, which are never pruned. That leaked
+    thousands of objects per graph build. Two properties keep it fixed: the
+    token must be cheap and stable, and it must still distinguish one kernel
+    from another (a constant token would silently collide two metrics' tasks).
+    """
+    from aorc_heat import core
+
+    celsius = pipeline._quiet_on_masked_nan(core.celsius_to_fahrenheit)
+    kelvin = pipeline._quiet_on_masked_nan(core.kelvin_to_celsius)
+    celsius_again = pipeline._quiet_on_masked_nan(core.celsius_to_fahrenheit)
+
+    assert celsius.__dask_tokenize__() == celsius_again.__dask_tokenize__()
+    assert celsius.__dask_tokenize__() != kelvin.__dask_tokenize__()
+
+    # Two graphs built over identical inputs must name their tasks identically,
+    # which is what lets dask deduplicate a shared intermediate at all.
+    import dask.array
+
+    from dask.base import tokenize
+
+    data = xr.DataArray(
+        dask.array.zeros((4, 2, 2), chunks=(4, 2, 2), dtype=np.float32),
+        dims=("time", "latitude", "longitude"),
+    )
+    assert tokenize(pipeline._apply(core.celsius_to_fahrenheit, data)) == tokenize(
+        pipeline._apply(core.celsius_to_fahrenheit, data)
+    )
+
+
+def test_kernel_reaches_a_worker_without_shipping_the_numba_kernel():
+    """The task graph must not carry a numba `DUFunc` to the workers.
+
+    `__dask_tokenize__` alone is not enough, and believing otherwise cost a
+    production run: it stops dask pickling the kernel to *name* a task, but
+    the callable still has to be serialised into the graph and rebuilt on
+    every worker, once per graph. A closure over a `DUFunc` cloudpickles the
+    DUFunc itself -- 6,676 bytes, with "numba" plainly in the payload -- and
+    each rebuild registers a typing template and a `DUFuncKernel` class in
+    numba's process-global registries, which are never pruned. Measured on a
+    real cluster that was ~99,000 dicts and ~300 MiB of worker RSS per block
+    write, climbing without bound.
+
+    Referring to the kernel by name instead makes the payload a class
+    reference plus a string, so a worker rebuilds it without touching numba.
+
+    This is checked here rather than through a cluster because the fault is
+    invisible to any single-process run: with the threaded or synchronous
+    scheduler nothing is ever serialised, so the leak simply does not happen.
+    """
+    import gc
+
+    import cloudpickle
+
+    wrapped = pipeline._quiet_on_masked_nan(core.heat_index)
+    payload = cloudpickle.dumps(wrapped, protocol=5)
+
+    assert b"numba" not in payload
+    assert b"DUFunc" not in payload
+    assert len(payload) < 512, f"payload grew to {len(payload)} bytes"
+
+    # Deserialising must still produce something that computes the same answer.
+    restored = cloudpickle.loads(payload)
+    arguments = (np.float32([90.0, 95.0]), np.float32([50.0, 60.0]))
+    np.testing.assert_array_equal(restored(*arguments), core.heat_index(*arguments))
+
+    # And repeating it must not accumulate. The closure retained ~131 objects
+    # per round trip; the bound here is loose enough not to be flaky and
+    # tight enough that a regression blows straight through it.
+    cloudpickle.loads(payload)
+    gc.collect()
+    before = len(gc.get_objects())
+    for _ in range(20):
+        cloudpickle.loads(payload)
+    gc.collect()
+    assert len(gc.get_objects()) - before < 500
+
+
+def test_store_allocated_at_a_different_time_chunk_is_rejected(tmp_path, synthetic_aorc_dataset):
+    """A store from a build with a different `OUTPUT_TIME_CHUNK_DAYS` must fail loudly.
+
+    `write_block` computes its time split from the constant and trusts that to
+    describe the store. For a store an earlier build allocated, it does not:
+    the variables keep the chunking they were created with. If the store's
+    chunks are larger, several write tasks land inside one of them and
+    read-modify-write each other, which `safe_chunks=False` has already
+    stopped zarr complaining about. Checked at `pending_metrics` time, so it
+    fails before a single year is computed rather than after.
+    """
+    from aorc_heat.mask import Region
+
+    mask = xr.DataArray(
+        np.ones((2, 2), dtype=bool),
+        dims=("latitude", "longitude"),
+        coords={
+            "latitude": synthetic_aorc_dataset.latitude,
+            "longitude": synthetic_aorc_dataset.longitude,
+        },
+    )
+    region = Region(mask=mask, latitude_slice=slice(0, 2), longitude_slice=slice(0, 2))
+    template = pipeline.daily_metrics(
+        pipeline.prepare_dataset(synthetic_aorc_dataset, region), ["temperature"]
+    )
+    axis = pipeline.daily_time_axis(2000, 2001)
+    store_path = tmp_path / pipeline.OUTPUT_STORE_NAME
+
+    original = pipeline.OUTPUT_TIME_CHUNK_DAYS
+    try:
+        pipeline.OUTPUT_TIME_CHUNK_DAYS = original * 2
+        pipeline.initialize_output_store(store_path, ["temperature"], axis, template)
+    finally:
+        pipeline.OUTPUT_TIME_CHUNK_DAYS = original
+
+    with pytest.raises(ValueError, match="time chunk"):
+        pipeline.pending_metrics(store_path, ["temperature"], axis)
+
+
+def test_output_time_chunk_does_not_span_a_whole_year():
+    """A year-long write chunk makes `write_block` hold the whole year.
+
+    `daily_metrics` emits daily output in 6-day chunks (one per native 144-hour
+    source chunk). `write_block` rechunks that to the store's grid, so the
+    store's time chunk is exactly how many of those pieces must be resident
+    before anything can be written. At 365 that was the entire year -- measured
+    at 2.85 GiB for two metrics and ~11 GiB for eight -- and nothing could be
+    released until it finished. Anything comfortably below a year restores
+    streaming writes; a multiple of 6 additionally means a write chunk is a
+    whole number of daily groups and the rechunk never splits one.
+    """
+    assert pipeline.OUTPUT_TIME_CHUNK_DAYS < 365
+    assert pipeline.OUTPUT_TIME_CHUNK_DAYS % 6 == 0
+    # 4 bytes per float32 cell, over the native (128, 256) spatial chunking.
+    chunk_bytes = pipeline.OUTPUT_TIME_CHUNK_DAYS * 128 * 256 * 4
+    assert 1e6 < chunk_bytes < 16e6, "store chunk outside zarr's 1-16 MB range"
+
+
 def test_native_spatial_chunks_reads_the_zarr_encoding(tmp_path):
     """Alignment must come from the on-disk chunk grid, not from dask.
 

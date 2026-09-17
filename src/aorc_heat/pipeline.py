@@ -89,11 +89,63 @@ GLOBAL_ATTRIBUTES = {
 }
 
 
+class _QuietCoreKernel:
+    """A `core` kernel plus NaN-quiet error state, referred to by *name*.
+
+    Deliberately not a closure over the kernel, because this object is what
+    dask puts in the task graph and therefore what every worker deserialises,
+    once per graph it receives.
+
+    A closure capturing a numba `DUFunc` cloudpickles the DUFunc itself --
+    6,676 bytes of it, measured, with "numba" and "DUFunc" plainly visible in
+    the bytes. Rebuilding a DUFunc from those bytes registers a fresh typing
+    template and `DUFuncKernel` class in numba's process-global registries,
+    which are never pruned: ~131 permanently retained objects per unpickle,
+    measured. Across a graph's tasks that came to **~99,000 dicts, ~38,600
+    tuples and ~300 MiB of RSS per block write, per worker**, climbing without
+    bound -- the leak that survived giving the closure a `__dask_tokenize__`,
+    because that only stops dask pickling the kernel to *name* a task and does
+    nothing about shipping it.
+
+    Holding the name instead makes `__reduce__` send a class reference and a
+    short string. The worker rebuilds this object without touching numba at
+    all and resolves the kernel with `getattr` at call time, against the
+    `core` module it has already imported.
+
+    `__dask_tokenize__` is still needed for the other half of the problem:
+    without it `dask.tokenize` falls back to pickling this object three times
+    over to check the token is stable.
+    """
+
+    __slots__ = ("name",)
+
+    def __init__(self, name):
+        self.name = name
+
+    @property
+    def __name__(self):
+        """Kernel name, which xarray and dask use to label the task."""
+        return self.name
+
+    def __call__(self, *blocks):
+        with np.errstate(invalid="ignore"):
+            return getattr(core, self.name)(*blocks)
+
+    def __reduce__(self):
+        return (_QuietCoreKernel, (self.name,))
+
+    def __dask_tokenize__(self):
+        return ("aorc_heat.core", self.name)
+
+    def __repr__(self):
+        return f"{type(self).__name__}({self.name!r})"
+
+
 def _quiet_on_masked_nan(kernel):
     """Wrap a `core` kernel so masked cells do not raise spurious FP warnings.
 
-    `prepare_dataset` masks with `.where`, so most cells reaching these kernels
-    are NaN by design. The kernels handle that correctly -- NaN in, NaN out --
+    `apply_mask` masks with `.where`, so most cells reaching these kernels are
+    NaN by design. The kernels handle that correctly -- NaN in, NaN out --
     but the branchy ones still emit
     "RuntimeWarning: invalid value encountered in ...", once per block, which
     on a 46-year run buries anything worth reading.
@@ -110,13 +162,43 @@ def _quiet_on_masked_nan(kernel):
     `test_finite_inputs_never_produce_non_finite_outputs`, which fails if any
     kernel ever turns finite input into NaN. Without that test this would be
     hiding evidence rather than filtering noise.
+
+    For a module-level `core` kernel this returns a `_QuietCoreKernel`, which
+    refers to the kernel by name rather than capturing it; read that class
+    before changing anything here. Anything else -- a lambda, a locally
+    defined function -- falls back to the closure below, which behaves
+    identically but pays the serialisation cost described there.
     """
+    name = getattr(kernel, "__name__", "kernel")
+    if getattr(core, name, None) is kernel:
+        return _QuietCoreKernel(name)
 
     def apply_quietly(*blocks):
         with np.errstate(invalid="ignore"):
             return kernel(*blocks)
 
-    apply_quietly.__name__ = getattr(kernel, "__name__", "kernel")
+    apply_quietly.__name__ = name
+    # Dask names every task after a hash of the callable that produces it, and
+    # it has no hash for the numba `DUFunc` this closure captures. It therefore
+    # falls back to `dask.tokenize._normalize_pickle`, which pickles the
+    # closure *and unpickles it again* to check the token is stable -- three
+    # times over, because a DUFunc does not pickle deterministically and the
+    # check never passes. Every `pickle.loads` of a DUFunc registers a fresh
+    # typing template and `DUFuncKernel` class in numba's process-global
+    # registries, which are never pruned, so the pipeline leaks roughly 750
+    # permanently-retained objects per `_apply` call -- measured at ~8,100 per
+    # block write, in the client and again in every worker that deserialises
+    # the graph. Over a 46-year run's 506 block writes that is millions of
+    # objects and hundreds of megabytes of unmanaged, unspillable memory, which
+    # is what drove workers into the pause/spill loop.
+    #
+    # Answering the question directly skips the pickle path entirely. The
+    # kernels are module-level `core` functions, created once at import and
+    # never rebound, so their name identifies them for the life of the process
+    # exactly as well as a content hash would. (The one thing a name cannot
+    # see is an edit to a kernel's *body* between runs; that only matters to a
+    # cache that outlives the process, and nothing here has one.)
+    apply_quietly.__dask_tokenize__ = lambda: ("aorc_heat.core", name)
     return apply_quietly
 
 
@@ -483,8 +565,8 @@ def native_spatial_chunks(dataset):
     )
 
 
-def prepare_dataset(dataset, region):
-    """Crop to the region bounding box, cast to float32, and mask.
+def crop_to_region(dataset, region):
+    """Crop to the region bounding box and cast to float32, without masking.
 
     No rechunking happens here. AORC's native 144-hour time chunk already holds
     six whole, midnight-aligned days, so `daily_metrics`'s `coarsen(time=24)`
@@ -494,17 +576,55 @@ def prepare_dataset(dataset, region):
     boundaries, so the cropped array lines up with both the source store and
     the output store as-is.
 
-    The cast to float32 happens before masking so that every downstream
-    intermediate is float32 too, not just the kernel outputs.
+    The cast happens here, before any masking, so that every downstream
+    intermediate is float32 too and not just the kernel outputs.
+
+    :param dataset: Full-domain AORC dataset
+    :param region: A `mask.Region` whose slices are snapped to chunk boundaries
+    :return: Cropped float32 dataset at the source's native chunking
+    """
+    return dataset.isel(
+        latitude=region.latitude_slice, longitude=region.longitude_slice
+    ).astype(np.float32)
+
+
+def apply_mask(dataset, region_mask):
+    """Mask out-of-region cells to NaN.
+
+    Split out from `crop_to_region` because *which* mask is applied, and when,
+    decides how big the resulting task graph is. `region_mask` is a plain numpy
+    array, and dask embeds a numpy array in the graph as a literal -- so the
+    mask handed to this function is copied, whole, into every graph built from
+    the result. Masking the entire bounding box up front and slicing blocks out
+    of it afterwards therefore puts all 2.9 MB of the Texas mask into each of
+    the 506 block-year graphs, 45% of a two-metric graph, when each block needs
+    one eleventh of it. `run` masks each block with that block's own slice
+    instead; measured, the graph drops from 6.84 MiB to 3.94 MiB.
+
+    Converting the mask to a dask array does not help -- the values still
+    travel inline, measured at the same 6.84 MiB -- so slicing first is the
+    thing that works, not rechunking.
+
+    :param dataset: A cropped float32 dataset
+    :param region_mask: Boolean DataArray covering exactly `dataset`'s grid
+    :return: The dataset with out-of-region cells set to NaN
+    """
+    return dataset.where(region_mask)
+
+
+def prepare_dataset(dataset, region):
+    """Crop to the region bounding box, cast to float32, and mask.
+
+    The composition of `crop_to_region` and `apply_mask` over the whole
+    bounding box. `run` does not use this -- it crops once per year and masks
+    per block, for the reason on `apply_mask` -- but it remains the one-call
+    form for a caller holding an entire box.
 
     :param dataset: Full-domain AORC dataset
     :param region: A `mask.Region` whose slices are snapped to chunk boundaries
     :return: Cropped, masked float32 dataset at the source's native chunking
     """
-    cropped = dataset.isel(
-        latitude=region.latitude_slice, longitude=region.longitude_slice
-    ).astype(np.float32)
-    return cropped.where(region.mask)
+    return apply_mask(crop_to_region(dataset, region), region.mask)
 
 
 def _first_timestamp(aorc_dataset):
@@ -626,36 +746,52 @@ def daily_metrics(aorc_dataset, metric_names):
 OUTPUT_STORE_NAME = "aorc_heat_metrics.zarr"
 
 #: Output time chunk, in days. Alongside the native (128, 256) spatial chunking
-#: this gives 365 * 128 * 256 * 4 B = ~48 MB chunks.
+#: this gives 60 * 128 * 256 * 4 B = 7.5 MB chunks.
 #:
 #: The spatial half of that shape is inherited, not chosen: the region crop is
 #: snapped to the source store's chunk grid so that no rechunk is needed on
 #: either read or write (see the module docstring), and the output store is
-#: allocated to match. The time chunk is then what makes the resulting chunk a
-#: reasonable size rather than a tiny one.
+#: allocated to match. The time chunk is the one free parameter, and it is what
+#: decides how much of a year `write_block` has to hold in memory at once.
 #:
-#: **This is a spatially-oriented layout, and reading a long time series at a
-#: single point is expensive under it.** One chunk holds a year for a whole
-#: 128x256 tile, so a 46-year record at one grid cell means decompressing 47
-#: chunks -- about 2.2 GB -- to extract 67 kB, and 48 MB is itself above the
-#: 1-16 MB zarr generally wants. An earlier version of this comment claimed the
-#: opposite, that the shape was "sized for reading long time series at a point";
-#: it was not, and it never has been. Reading whole-domain maps, which is what
-#: the layout genuinely suits, costs the same ~2.4 GB for every cell of a day
-#: rather than for one.
+#: **60 rather than 365, because a year-long chunk is a memory barrier.**
+#: `daily_metrics` produces daily output in six-day chunks -- one per native
+#: 144-hour source chunk. `write_block` then rechunks along time to land inside
+#: the store's chunks, and at 365 that is a rechunk from 61 pieces to one: a
+#: single concatenation task with 61 dependencies, per variable, per longitude
+#: tile. Nothing can be written, and therefore nothing released, until the
+#: entire year exists in memory -- measured at 2.85 GiB for two metrics on the
+#: widest Texas block and roughly 11 GiB for all eight. That is what made
+#: worker memory climb monotonically inside each year and drove the cluster
+#: into a pause/spill loop. At 60 the concatenation takes 10 pieces, seven
+#: write chunks span the year, and each one completes and frees its inputs.
 #:
-#: Improving point extraction means either splitting the output spatially
-#: (365 x 32 x 64 gives 3 MB chunks and cuts a point series to ~140 MB, at no
-#: cost to map reads, and still writes incrementally) or building a separate
-#: store chunked along time in a post-pass. Both were considered and
-#: deliberately not done; the layout is left as-is.
+#: 60 is deliberately a multiple of six, so a write chunk is a whole number of
+#: the six-day groups and the rechunk never has to split one.
+#:
+#: The size is also what zarr wants. 48 MB (the old 365-day chunk) is well
+#: above the 1-16 MB range; 7.5 MB sits inside it.
+#:
+#: This does **not** improve point extraction, and it was not chosen to. The
+#: cost of a single-cell time series is set by the *spatial* extent of a chunk,
+#: not the temporal one: 46 years at one grid cell was ~47 chunks x 48 MB =
+#: 2.2 GB and is now ~280 chunks x 7.5 MB = 2.1 GB, which is the same number
+#: differently divided. This remains a spatially-oriented layout that suits
+#: whole-domain map reads. Splitting the output spatially (32 x 64 tiles, which
+#: would cut a point series to ~130 MB at no cost to map reads) is the change
+#: that would fix point extraction, and it is still deliberately not done.
 #:
 #: This cannot divide the year boundaries: years alternate 365 and 366 days, so
 #: no fixed chunk size lines up with every year's start. Each yearly write
 #: therefore lands partially inside the chunks at its two ends. That is safe
 #: here, but only because of how `write_block` and `run` are arranged -- see the
-#: contract on `write_block` before changing either.
-OUTPUT_TIME_CHUNK_DAYS = 365
+#: contract on `write_block` before changing either. A smaller chunk does not
+#: change that argument: it is still exactly one straddled chunk per year
+#: boundary, just a cheaper one to read-modify-write.
+#:
+#: Changing this changes the store's chunk grid, so an existing store must be
+#: rebuilt rather than extended.
+OUTPUT_TIME_CHUNK_DAYS = 60
 
 OUTPUT_DIMENSIONS = ("time", "latitude", "longitude")
 
@@ -738,6 +874,41 @@ def _as_comparable_dates(time_index):
             timestamp = pd.Timestamp(timestamp)
         dates.append((timestamp.year, timestamp.month, timestamp.day))
     return dates
+
+
+def _validate_time_chunk(existing, store_path):
+    """Raise unless the store was allocated at the current `OUTPUT_TIME_CHUNK_DAYS`.
+
+    `write_block` splits a block along time with
+    `chunk_sizes_aligned_to_store(..., OUTPUT_TIME_CHUNK_DAYS)`, so that
+    constant is trusted to describe the store's real chunk grid. For a store
+    created by an *earlier* run it may not: the variables keep whatever
+    chunking they were allocated with, and nothing in the write path looks.
+
+    A mismatch is not cosmetic. The guarantee that makes `safe_chunks=False`
+    safe -- that no two dask tasks in one write target the same store chunk --
+    is computed from this constant. If the store's chunks are larger, several
+    write tasks land inside one of them and read-modify-write each other
+    concurrently, losing updates with nothing raised. Verified: a store
+    allocated at 365 days accepts a 60-day write with no error at all.
+
+    :param existing: The already-open existing store's Dataset
+    :param store_path: Path to the store, for the error message
+    :raises ValueError: If the store's time chunk is not OUTPUT_TIME_CHUNK_DAYS
+    """
+    for name, variable in existing.data_vars.items():
+        chunks = variable.encoding.get("chunks")
+        if not chunks:
+            continue
+        if int(chunks[0]) != OUTPUT_TIME_CHUNK_DAYS:
+            raise ValueError(
+                f"Existing store at {store_path} was allocated with a time chunk "
+                f"of {int(chunks[0])} days (seen on {name}), but this build writes "
+                f"{OUTPUT_TIME_CHUNK_DAYS}-day blocks. Writing into it would let "
+                "two tasks read-modify-write one chunk and silently lose data. "
+                "Delete the store and rebuild it."
+            )
+        return
 
 
 def _validate_time_axis(existing, time_axis, store_path):
@@ -836,6 +1007,7 @@ def pending_metrics(store_path, metric_names, time_axis):
 
     existing = xr.open_zarr(store_path, consolidated=True)
     _validate_time_axis(existing, time_axis, store_path)
+    _validate_time_chunk(existing, store_path)
 
     required_years = {timestamp.year for timestamp in np.asarray(time_axis)}
     completed_years = _read_completed_years(store_path)
@@ -993,6 +1165,12 @@ def write_block(store_path, daily, time_axis, latitude_slice=None, longitude_sli
     same sizes, so they already align. Coordinate variables are dropped because
     they already exist in the store.
 
+    That time split is also the pipeline's peak-memory knob, not just a
+    correctness one: it rechunks `daily`'s native 6-day pieces up to
+    `OUTPUT_TIME_CHUNK_DAYS`, and every piece feeding one output chunk has to
+    be resident before that chunk can be written. See the comment on the
+    constant before raising it.
+
     `latitude_slice` and `longitude_slice` name where the block sits in the
     store's spatial grid. They come from `mask.occupied_chunk_blocks`, so both
     edges land on store chunk boundaries and each block covers whole chunks.
@@ -1044,14 +1222,20 @@ def write_block(store_path, daily, time_axis, latitude_slice=None, longitude_sli
     return store_region
 
 
-def open_aorc_year(year, region, variable_names, filesystem=None):
+def open_aorc_year(year, region, variable_names, filesystem=None, mask=True):
     """Open one AORC year, restricted to the requested variables and region.
 
     :param year: Calendar year to open
     :param region: A `mask.Region` describing the area of interest
     :param variable_names: Raw AORC variable names to read
     :param filesystem: Optional preconfigured s3fs filesystem
-    :return: Cropped, masked, rechunked dataset
+    :param mask: Whether to mask out-of-region cells here. `run` passes False
+        and masks each block with that block's own slice of the mask instead,
+        which keeps the full-box mask out of every block's task graph -- see
+        `apply_mask`. The default masks the whole box, matching
+        `prepare_dataset`.
+    :return: Cropped float32 dataset at the source's native chunking, masked
+        unless `mask` is False
     """
     if filesystem is None:
         import s3fs
@@ -1061,7 +1245,8 @@ def open_aorc_year(year, region, variable_names, filesystem=None):
     dataset = xr.open_zarr(
         filesystem.get_mapper(f"{AORC_S3_BASE_PATH}{year}.zarr"), consolidated=True
     )
-    return prepare_dataset(dataset[list(variable_names)], region)
+    cropped = crop_to_region(dataset[list(variable_names)], region)
+    return apply_mask(cropped, region.mask) if mask else cropped
 
 
 def run(output_dir, metric_names, start_year, end_year, filesystem=None):
@@ -1118,7 +1303,10 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
     )
 
     variables = required_variables(pending)
-    first_year = open_aorc_year(start_year, region, variables, filesystem)
+    # Unmasked, like the per-year opens below: this is only ever read for its
+    # grid -- chunk sizes, dimension sizes, and the two spatial coordinates --
+    # and none of those depend on the mask.
+    first_year = open_aorc_year(start_year, region, variables, filesystem, mask=False)
     # The template spans the whole bounding box on purpose: the store's shape
     # and spatial coordinates are those of the full box, and only the *writes*
     # are restricted to occupied blocks. Chunks no block ever touches keep the
@@ -1147,7 +1335,7 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
 
     for year in range(start_year, end_year + 1):
         _log(f"[compute] Deriving metrics for {year}.")
-        dataset = open_aorc_year(year, region, variables, filesystem)
+        dataset = open_aorc_year(year, region, variables, filesystem, mask=False)
         # In-region cell-days summed across every pending metric's own
         # `valid_hours` -- a cell-day incomplete for two requested metrics is
         # counted twice, because the two metrics can disagree about which
@@ -1161,10 +1349,18 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
         # selecting a block reads only that block's chunks -- the empty ones are
         # never fetched, decompressed, or reduced at all.
         for index, (latitude_slice, longitude_slice) in enumerate(blocks, start=1):
-            block = dataset.isel(latitude=latitude_slice, longitude=longitude_slice)
+            # Crop first, then mask with this block's own slice. `dataset` is
+            # deliberately unmasked (`mask=False` above) so that the mask
+            # reaching this block's graph is the block's slice and not the
+            # whole bounding box -- see `apply_mask` for why that is worth
+            # 2.9 MB in every one of the run's graphs.
             block_mask = region.mask.isel(
                 latitude=latitude_slice, longitude=longitude_slice
-            ).values
+            )
+            block = apply_mask(
+                dataset.isel(latitude=latitude_slice, longitude=longitude_slice),
+                block_mask,
+            )
             daily = daily_metrics(block, pending)
             store_region = write_block(
                 store_path,
@@ -1185,7 +1381,9 @@ def run(output_dir, metric_names, start_year, end_year, filesystem=None):
             # back in milliseconds.
             written = xr.open_zarr(store_path, consolidated=True).isel(**store_region)
             for name in pending:
-                in_region_hours = written[f"{name}_valid_hours"].values[:, block_mask]
+                in_region_hours = written[f"{name}_valid_hours"].values[
+                    :, block_mask.values
+                ]
                 incomplete_cell_days += int(np.count_nonzero(in_region_hours < 24))
                 fully_missing_cell_days += int(np.count_nonzero(in_region_hours == 0))
             _log(f"[compute] {year}: wrote block {index}/{len(blocks)}.")

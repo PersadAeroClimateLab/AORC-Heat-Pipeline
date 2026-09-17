@@ -79,6 +79,45 @@ def test_positive_cores_is_accepted():
     assert arguments.cores == 8
 
 
+def test_threads_per_worker_defaults_to_the_historical_one_process_per_core():
+    """The default must not silently change an existing job script's cluster.
+
+    `--memory-limit` is per worker *process*, so a default above 1 would divide
+    every existing invocation's total cluster memory by that factor while
+    looking identical on the command line.
+    """
+    arguments = cli.build_parser().parse_args(BASE_ARGUMENTS + ["--all"])
+    assert arguments.threads_per_worker == cli.DEFAULT_THREADS_PER_WORKER == 1
+    assert cli.cluster_shape(arguments) == (8, 1)
+
+
+def test_cores_is_the_total_thread_count_not_the_process_count():
+    """40 cores at 5 threads is 8 processes, not 40."""
+    arguments = cli.build_parser().parse_args(
+        ["--output-dir", "/tmp/out", "--cores", "40", "--memory-limit", "25GB",
+         "--threads-per-worker", "5", "--all"]
+    )
+    workers, threads = cli.cluster_shape(arguments)
+    assert (workers, threads) == (8, 5)
+    assert workers * threads == arguments.cores
+
+
+def test_cores_not_divisible_by_threads_per_worker_is_rejected():
+    """Floor division would run fewer threads than asked for, silently."""
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            ["--output-dir", "/tmp/out", "--cores", "40", "--memory-limit", "25GB",
+             "--threads-per-worker", "3", "--all"]
+        )
+
+
+def test_zero_threads_per_worker_is_rejected():
+    with pytest.raises(SystemExit):
+        cli.build_parser().parse_args(
+            BASE_ARGUMENTS + ["--all", "--threads-per-worker", "0"]
+        )
+
+
 def test_dashboard_address_defaults_to_an_ephemeral_port():
     arguments = cli.build_parser().parse_args(BASE_ARGUMENTS + ["--all"])
     assert arguments.dashboard_address == cli.DEFAULT_DASHBOARD_ADDRESS == ":0"

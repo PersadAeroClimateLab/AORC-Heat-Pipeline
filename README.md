@@ -36,7 +36,8 @@ Compute every metric across the full record:
 
 ```bash
 docker run --rm -v "$PWD":/project -w /project aorc \
-    aorc-heat --all --output-dir output_zarrs --cores 80 --memory-limit 10GB
+    aorc-heat --all --output-dir output_zarrs \
+              --cores 80 --threads-per-worker 5 --memory-limit 50GB
 ```
 
 Compute a subset, or a shorter period:
@@ -44,9 +45,19 @@ Compute a subset, or a shorter period:
 ```bash
 docker run --rm -v "$PWD":/project -w /project aorc \
     aorc-heat --metrics heat_index humidex \
-              --output-dir output_zarrs --cores 80 --memory-limit 10GB \
+              --output-dir output_zarrs \
+              --cores 80 --threads-per-worker 5 --memory-limit 50GB \
               --start-year 2020 --end-year 2021
 ```
+
+`--cores` is the **total** number of worker threads; `--threads-per-worker`
+decides how many processes that becomes (here 16 of 5 threads each).
+`--memory-limit` is per *process*, so it has to be scaled by the same factor —
+the two examples above give the same 800 GB cluster as `--cores 80
+--memory-limit 10GB` did with one thread per process. Threads are worth
+preferring: the numba kernels release the GIL, and every extra process costs
+~390 MB of interpreter and JIT state before it holds any data. The shape and
+its total are printed at startup.
 
 Metrics already present in the store are skipped rather than recomputed, so a
 later run that adds `--metrics wet_bulb_temperature` appends those variables
@@ -57,8 +68,10 @@ store was built for.
 
 A single store at `<output-dir>/aorc_heat_metrics.zarr` with dimensions
 `(time, latitude, longitude)`, one entry per day, and a
-`{metric}_{min,mean,max}` variable for each computed metric. Cells outside the
-Texas boundary are NaN.
+`{metric}_{min,mean,max}` variable for each computed metric, plus a
+`{metric}_valid_hours` count. Cells outside the Texas boundary are NaN.
+Chunked `(60, 128, 256)`, which suits whole-domain map reads rather than long
+time series at a single point.
 
 ## Tests
 
